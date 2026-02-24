@@ -15,7 +15,8 @@ set(SOFTHIER_RUNTIME_HOME ${SOFTHIER_SDK_HOME}/runtime)
 
 # runtime libraries from SoftHier directory
 set(SOFTHIER_INCLUDES
-    ${SOFTHIER_RUNTIME_HOME}/include
+    ${SOFTHIER_RUNTIME_HOME}/deeploy_include
+    # ${SOFTHIER_RUNTIME_HOME}/include
 )
 
 set(SOFTHIER_RUNTIME_ASM_SOURCE
@@ -32,7 +33,7 @@ add_library(softhier-sdk OBJECT
 )
 
 target_compile_options(softhier-sdk PRIVATE
-  -I${SOFTHIER_RUNTIME_HOME}/include
+  -I${SOFTHIER_RUNTIME_HOME}/deeploy_include
 )
 target_include_directories(softhier-sdk SYSTEM PUBLIC ${SOFTHIER_INCLUDES})
 
@@ -57,7 +58,7 @@ target_compile_options(softhier-sdk INTERFACE
 )
 
 set(SOFTHIER_LINKER_SCRIPT
-${SOFTHIER_RUNTIME_HOME}/flex_memory.ld
+${SOFTHIER_RUNTIME_HOME}/flex_memory_deeploy.ld
 )
 
 set(SOFTHIER_LINK_OPTIONS

@@ -12,6 +12,7 @@
 #include "flex_dma_pattern.h"
 #include "flex_printf.h"
 #include "flex_runtime.h"
+#include "flex_redmule.h"
 
 // Deeploy-generated
 #include "Network.h"
@@ -93,11 +94,11 @@ int main() {
             tot_err += 1;
             printf("Expected: %4d  ", expected);
             printf("Actual: %4d  ", actual);
-            printf("Diff: %4d at Index %12u in Output %u\r\n", diff, i, buf);
+            printf("Diff: %4d at Index %12lu in Output %lu\r\n", diff, i, buf);
           }
         }
       }
-      printf("Errors: %d out of %d \r\n", tot_err, tot);
+      printf("Errors: %ld out of %ld \r\n", tot_err, tot);
     }
     flex_intra_cluster_sync(); // Cluster barrier
   }

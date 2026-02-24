@@ -17,4 +17,7 @@
 
 #include "DeeployBasicMath.h"
 
+#include "kernel/Gemm.h"
+#include "kernel/Redmule_Gemm_fp32.h"
+
 #endif // __DEEPLOY_MATH_HEADER_

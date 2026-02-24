@@ -12,6 +12,7 @@ add_deeploy_library(deeploysofthier STATIC ${SOURCES})
 target_include_directories(deeploysofthier
     PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/inc
+    ${CMAKE_CURRENT_LIST_DIR}/inc/kernel
 )
 
 target_compile_options(deeploysofthier PRIVATE
