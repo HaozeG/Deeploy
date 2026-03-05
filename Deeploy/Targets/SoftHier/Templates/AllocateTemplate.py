@@ -4,9 +4,9 @@
 
 from Deeploy.DeeployTypes import NodeTemplate
 
-SoftHierInitTemplate = NodeTemplate("${type.typeName} ${name} __attribute__((section(\".l1\")));\n")
+SoftHierInitTemplate = NodeTemplate("${type.typeName} ${name} __attribute__((section(\".hbm\")));\n")
 SoftHierAllocateTemplate = NodeTemplate("""
-if (core_id ==0) {
+if (flex_is_dm_core()) {
     % if _memoryLevel == "L1":
     ${name} = (${type.typeName}) flex_l1_malloc(sizeof(${type.referencedType.typeName}) * ${size});\n
     % else:
@@ -16,15 +16,26 @@ if (core_id ==0) {
 """)
 
 SoftHierGlobalInitTemplate = NodeTemplate(
-    "static ${type.referencedType.typeName} ${name}[${size}] __attribute__((section(\".l2\"))) = {${values}};\n")
-SoftHierGlobalAllocateTemplate = NodeTemplate("")
+    "static ${type.referencedType.typeName} ${name}[${size}] __attribute__((section(\".hbm\"))) = {${values}};\n")
+SoftHierGlobalAllocateTemplate = NodeTemplate("""
+// if (flex_is_dm_core()) {
+//     ${name} = (${type.typeName}) flex_hbm_malloc(sizeof(${type.referencedType.typeName}) * ${size});\n
+// }
+""")
+
+SoftHierTransientInitTemplate = NodeTemplate("static ${type.typeName} ${name};\n")
+SoftHierTransientAllocateTemplate = NodeTemplate("""
+if (flex_is_dm_core()) {
+    ${name} = (${type.typeName}) flex_l1_malloc(${size});\n
+}
+""")
 
 SoftHierStructInitTemplate = NodeTemplate("""
 static ${type.typeName} ${name} __attribute__((section(\".l1\")));
 """)
 
 SoftHierStructAllocateTemplate = NodeTemplate("""
-if (core_id == 0) {
+if (flex_is_dm_core()) {
     ${name} = (${structDict.typeName}) ${str(structDict)};
 }
 """)

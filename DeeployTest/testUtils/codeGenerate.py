@@ -84,6 +84,12 @@ def generateTestOutputsHeader(deployer: NetworkDeployer, test_outputs: List[np.n
         typeWidth = deployer.ctxt.lookup(f'output_{index}')._type.referencedType.typeWidth
 
         retStr += f"#define OUTPUTTYPE {typeName}\n"
+        if deployer.Platform.engines[0].name == "SoftHier":
+            # inputs, outputs and constants on SoftHier are in float32, would be converted to customized float16 in the kernels 
+            if typeName == "float32_t":
+                retStr += f"#define ISFLOAT32 1\n"
+            else:
+                retStr += f"#define ISFLOAT32 0\n"
         retStr += f"#define ISOUTPUTFLOAT {int(typeName == 'float32_t')}\n"
         retStr += f"{typeName} testOutputVector{index}[] ="
         retStr += "{"

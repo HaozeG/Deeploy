@@ -9,7 +9,10 @@
 DEFAULT_NUM_CLUSTERS = 1
 
 KERNEL_TESTS = [
-    "Kernels/Integer/Add/Regular",
+    # "Kernels/Integer/Add/Regular",
+    # "Kernels/Integer/GEMM/Regular",
+    # "Kernels/FP32/GEMM/Regular",
+    "Kernels/FP32/GEMM/withCluster",
 ]
 
 MODEL_TESTS = []

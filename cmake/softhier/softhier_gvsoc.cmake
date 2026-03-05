@@ -14,6 +14,11 @@ macro(add_gvsoc_emulation name)
             --target=pulp.chips.flex_cluster.flex_cluster
             --binary ${BINARY_PATH}
             run
+            # --trace=/chip/cluster_0/redmule 
+            # --trace=/chip/cluster_0/idma 
+            # --trace=/chip/cluster_0/pe0/insn 
+            # --trace=/chip/cluster_0/pe2/insn 
+            | tee $ENV{SOFTHIER_INSTALL_DIR}/gvsoc_${name}.log
     COMMENT "Simulating deeploytest with GVSOC"
     USES_TERMINAL
     VERBATIM

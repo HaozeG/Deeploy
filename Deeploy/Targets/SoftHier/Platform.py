@@ -12,6 +12,7 @@ from Deeploy.Targets.Generic.Layers import AddLayer, GEMMLayer
 from Deeploy.Targets.Generic.Parsers import AddParser
 from Deeploy.Targets.SoftHier.Parsers import SoftHierGEMMParser
 from Deeploy.Targets.SoftHier.Templates import AllocateTemplate, FreeTemplate
+from Deeploy.Targets.SoftHier.Templates.AllocateTemplate import SoftHierTransientInitTemplate, SoftHierTransientAllocateTemplate
 from Deeploy.Targets.SoftHier.Bindings import SoftHierGemmBindings
 # Basic bindings
 Add_Mapper = NodeMapper(AddParser(), BasicAddBindings)
@@ -37,12 +38,12 @@ SoftHierlMapping = {
     'Add': AddLayer([Add_Mapper])
 }
 
-
+# TODO: check all buffer's init, alloc, dealloc implementations
 class SoftHierVariableBuffer(VariableBuffer):
 
     initTemplate = AllocateTemplate.SoftHierInitTemplate
     allocTemplate = AllocateTemplate.SoftHierAllocateTemplate
-    deallocTemplate = FreeTemplate.SoftHierLocalTemplate
+    deallocTemplate = FreeTemplate.SoftHierGlobalTemplate
 
     def _bufferRepresentation(self):
 
@@ -61,8 +62,8 @@ class SoftHierVariableBuffer(VariableBuffer):
 
 class SoftHierTransientBuffer(TransientBuffer):
 
-    initTemplate = AllocateTemplate.SoftHierInitTemplate
-    allocTemplate = AllocateTemplate.SoftHierAllocateTemplate
+    initTemplate = SoftHierTransientInitTemplate
+    allocTemplate = SoftHierTransientAllocateTemplate
     deallocTemplate = FreeTemplate.SoftHierLocalTemplate
 
     def _bufferRepresentation(self):
@@ -72,12 +73,8 @@ class SoftHierTransientBuffer(TransientBuffer):
         else:
             memoryLevel = None
 
-        return {
-            "type": self._instance,
-            "name": self.name,
-            "size": int(np.prod(self.shape)),
-            "_memoryLevel": memoryLevel
-        }
+        return {"type": self._type, "name": self.name, "size": self.size, "_memoryLevel": memoryLevel}
+
 
 
 class SoftHierConstantBuffer(ConstantBuffer):
@@ -107,7 +104,7 @@ class SoftHierStructBuffer(StructBuffer):
 
 
 SoftHierOptimizer = TopologyOptimizer([], name = "SoftHierOptimizer")
-includeList = ["flex_alloc_api.h", "flex_runtime_api.h", "flex_redmule_api.h", "flex_dma_api.h", "flex_types.h", "DeeploySoftHierMath.h"]
+includeList = ["flex_alloc_api.h", "flex_runtime_api.h", "flex_redmule_api.h", "flex_dma_api.h", "flex_types.h", "flex_printf_api.h","DeeploySoftHierMath.h"]
 
 
 class SoftHierEngine(DeploymentEngine):

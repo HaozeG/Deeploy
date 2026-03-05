@@ -4,7 +4,7 @@ from Deeploy.AbstractDataTypes import PointerClass
 from Deeploy.CommonExtensions.CodeTransformationPasses.Closure import ClosureGeneration, MemoryAwareClosureGeneration
 from Deeploy.CommonExtensions.CodeTransformationPasses.MemoryAllocation import ArgumentStructGeneration, \
     MemoryManagementGeneration
-from Deeploy.CommonExtensions.DataTypes import int8_t, uint8_t, float16_t, int16_t, uint16_t
+from Deeploy.CommonExtensions.DataTypes import int8_t, uint8_t, float16_t, int16_t, uint16_t, float32_t
 from Deeploy.DeeployTypes import CodeTransformation, NodeBinding
 from Deeploy.FutureExtension.CodeTransformationPasses.FutureCodeTransformation import FutureGeneration
 from Deeploy.Targets.Generic.Templates import iNoNormTemplate
@@ -25,5 +25,5 @@ TiledTransformer = CodeTransformation([
 
 # TODO: type checker not completed yet
 SoftHierGemmBindings = [
-    NodeBinding(GEMMChecker([PointerClass(_type), PointerClass(_type), PointerClass(_type)], [PointerClass(_type)]), SoftHierGemm_Template, TiledTransformer) for _type in [int8_t, uint8_t, int16_t, uint16_t, float16_t]
+    NodeBinding(GEMMChecker([PointerClass(_type), PointerClass(_type), PointerClass(_type)], [PointerClass(_type)]), SoftHierGemm_Template, TiledTransformer) for _type in [int8_t, uint8_t, int16_t, uint16_t, float16_t, float32_t]
 ]

@@ -16,7 +16,6 @@ set(SOFTHIER_RUNTIME_HOME ${SOFTHIER_SDK_HOME}/runtime)
 # runtime libraries from SoftHier directory
 set(SOFTHIER_INCLUDES
     ${SOFTHIER_RUNTIME_HOME}/deeploy_include
-    # ${SOFTHIER_RUNTIME_HOME}/include
 )
 
 set(SOFTHIER_RUNTIME_ASM_SOURCE

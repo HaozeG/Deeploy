@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef __DEEPLOY_MATH_HEADER_
-#define __DEEPLOY_MATH_HEADER_
+#ifndef __DEEPLOY_SOFTHIER_MATH_HEADER_
+#define __DEEPLOY_SOFTHIER_MATH_HEADER_
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -17,7 +17,15 @@
 
 #include "DeeployBasicMath.h"
 
-#include "kernel/Gemm.h"
-#include "kernel/Redmule_Gemm_fp32.h"
+#include "flex_runtime_api.h"
+#include "flex_cluster_arch.h"
+#include "flex_dma_api.h"
+#include "flex_redmule_api.h"
+#include "flex_group_barrier_api.h"
+#include "flex_types.h"
 
-#endif // __DEEPLOY_MATH_HEADER_
+#define LOG_ENABLE
+#include "kernel/Gemm.h"
+#include "kernel/hello_world.h"
+
+#endif // __DEEPLOY_SOFTHIER_MATH_HEADER_

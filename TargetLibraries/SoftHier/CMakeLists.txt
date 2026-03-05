@@ -23,5 +23,7 @@ target_compile_options(deeploysofthier PRIVATE
   -Wno-sign-compare
 )
 
+# Link with SoftHier runtime libraries
+target_include_directories(deeploysofthier SYSTEM PUBLIC ${SOFTHIER_INCLUDES})
 target_link_libraries(deeploysofthier INTERFACE softhier-sdk)
 target_sources(deeploysofthier INTERFACE $<TARGET_OBJECTS:softhier-sdk>)
