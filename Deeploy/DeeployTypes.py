@@ -517,6 +517,46 @@ class NetworkContext():
                  globalObjects = {},
                  localObjects = {},
                  name: str = 'DeeployNetwork'):
+        """Initialize a new NetworkContext.
+
+        Parameters
+        ----------
+        variableBuffer : Type[VariableBuffer]
+            Buffer **class** (not instance) used for network I/O tensors.
+            For the **SoftHier TileLang path**: pass ``SoftHierDynamicBuffer``.
+            Its ``_memoryLevel`` attribute selects L1 vs HBM allocation.
+            Its ``cluster_id`` attribute (``None`` or ``int``) causes the
+            generated alloc / compute code to be wrapped in::
+
+                uint32_t CID = flex_get_cluster_id();
+                if (CID == cluster_id) { ... }
+
+        constantBuffer : Type[ConstantBuffer]
+            Buffer class for compile-time weight tensors (static data).
+            For **SoftHier TileLang**: pass ``SoftHierDynamicBuffer``
+            with ``_memoryLevel='HBM'`` (weights live in HBM).
+
+        structBuffer : Type[StructBuffer]
+            Buffer class for hardware-specific struct objects (e.g. DMA
+            descriptors, barrier objects).
+            For **SoftHier TileLang**: pass ``SoftHierDynamicBuffer``.
+
+        transientBuffer : Type[TransientBuffer]
+            Buffer class for intermediate scratch memory allocated and freed
+            per-kernel (e.g. L1 tile staging buffers).
+            For **SoftHier TileLang**: pass ``SoftHierDynamicBuffer``
+            with ``_memoryLevel='L1'`` (fragment/shared buffers map to L1).
+
+        globalObjects : dict, optional
+            Pre-populated global object dictionary (rarely used directly).
+
+        localObjects : dict, optional
+            Pre-populated local object dictionary (rarely used directly).
+
+        name : str, optional
+            Symbolic name of the network; used for C symbol mangling
+            (default ``'DeeployNetwork'``).
+        """
         self.globalObjects = OrderedDict()
         self.localObjects = OrderedDict()
         self.VariableBuffer = variableBuffer

@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from typing import List, Tuple
+import shutil
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -293,3 +294,157 @@ def generateTestNetwork(deployer: NetworkDeployer, test_inputs: List[np.ndarray]
     os.system(f'clang-format -i --style="{clang_format}" {dumpdir}/Network.h')
     os.system(f'clang-format -i --style="{clang_format}" {dumpdir}/testoutputs.h')
     os.system(f'clang-format -i --style="{clang_format}" {dumpdir}/testinputs.h')
+
+
+def _tilelang_numpy_to_c_literal(value) -> str:
+    if isinstance(value, np.floating):
+        return f"{float(value)}f"
+    return str(int(value))
+
+
+def _tilelang_numpy_dtype_to_ctype(dtype: np.dtype) -> str:
+    if dtype == np.float16:
+        return "fp16"
+    if dtype == np.float32:
+        return "float32_t"
+    if dtype == np.int8:
+        return "int8_t"
+    if dtype == np.uint8:
+        return "uint8_t"
+    if dtype == np.int16:
+        return "int16_t"
+    if dtype == np.uint16:
+        return "uint16_t"
+    if dtype == np.int32:
+        return "int32_t"
+    if dtype == np.uint32:
+        return "uint32_t"
+    raise ValueError(f"Unsupported TileLang vector dtype for C header generation: {dtype}")
+
+
+def _generate_tilelang_vectors_header(var_prefix: str, arrays: Sequence[np.ndarray]) -> str:
+    if not arrays:
+        return f"void* {var_prefix}Vector[0] = {{}};\n"
+
+    retStr = ""
+    names = []
+    for idx, arr in enumerate(arrays):
+        flat = np.asarray(arr).reshape(-1)
+        ctype = _tilelang_numpy_dtype_to_ctype(flat.dtype)
+        var_name = f"{var_prefix}Vector{idx}"
+        names.append(var_name)
+        elems = ", ".join(_tilelang_numpy_to_c_literal(v) for v in flat)
+        retStr += f"{ctype} {var_name}[] = {{{elems}}};\n"
+
+    retStr += f"void* {var_prefix}Vector[{len(names)}] = " + "{" + ", ".join(names) + "};\n"
+    return retStr
+
+
+def generateTilelangSoftHierNetworkHeader(
+    functionSignature: str = "void tilelang_main(fp16* A, fp16* B, fp16* C)"
+) -> str:
+    return f"""
+#ifndef __DEEPLOY_TILELANG_SOFTHIER_HEADER__
+#define __DEEPLOY_TILELANG_SOFTHIER_HEADER__
+
+#include <stdint.h>
+#include "flex_types.h"
+
+{functionSignature};
+
+#endif
+"""
+
+
+def generateTilelangSoftHierNetworkImplementation(
+    tilelangBody: str,
+    functionSignature: str = "void tilelang_main(fp16* A, fp16* B, fp16* C)",
+    includeList: Optional[Sequence[str]] = None,
+    deployer: Optional[NetworkDeployer] = None,
+    bufferInitializationCode: Optional[str] = None,
+    globalDefinitionCode: Optional[str] = None,
+) -> str:
+    resolved_includes = list(includeList) if includeList is not None else [
+        "flex_alloc_api.h",
+        "flex_runtime_api.h",
+        "flex_redmule_api.h",
+        "flex_dma_api.h",
+        "flex_group_barrier_api.h",
+        "flex_types.h",
+        "flex_printf_api.h",
+        "DeeploySoftHierMath.h",
+    ]
+
+    includeStr = ""
+    for include in resolved_includes:
+        includeStr += f'#include "{include}"\n'
+    includeStr += "#include \"Network.h\"\n"
+    includeStr += "#include <stdint.h>\n"
+    includeStr += "#include <string.h>\n"
+
+    # If snippets are not provided explicitly, derive them from the deployer.
+    resolved_buffer_init = bufferInitializationCode
+    resolved_global_defs = globalDefinitionCode
+
+    if deployer is not None:
+        if resolved_buffer_init is None:
+            resolved_buffer_init = deployer.generateBufferInitializationCode()
+        if resolved_global_defs is None:
+            resolved_global_defs = deployer.generateGlobalDefinitionCode()
+
+    if resolved_buffer_init is None:
+        resolved_buffer_init = ""
+    if resolved_global_defs is None:
+        resolved_global_defs = ""
+
+    return f"""{includeStr}
+{resolved_buffer_init}
+{resolved_global_defs}
+{functionSignature} {{
+{tilelangBody}
+}}
+"""
+
+
+def generateTilelangSoftHierTestNetwork(
+    tilelangBody: str,
+    dumpdir: str,
+    functionSignature: str = "void tilelang_main(fp16* A, fp16* B, fp16* C)",
+    test_inputs: Optional[Sequence[np.ndarray]] = None,
+    test_outputs: Optional[Sequence[np.ndarray]] = None,
+    includeList: Optional[Sequence[str]] = None,
+    deployer: Optional[NetworkDeployer] = None,
+    bufferInitializationCode: Optional[str] = None,
+    globalDefinitionCode: Optional[str] = None,
+) -> None:
+    os.makedirs(dumpdir, exist_ok = True)
+
+    networkHeader = generateTilelangSoftHierNetworkHeader(functionSignature)
+    with open(f"{dumpdir}/Network.h", "w", encoding = "utf-8") as f:
+        f.write(networkHeader)
+
+    networkImpl = generateTilelangSoftHierNetworkImplementation(
+        tilelangBody,
+        functionSignature = functionSignature,
+        includeList = includeList,
+        deployer = deployer,
+        bufferInitializationCode = bufferInitializationCode,
+        globalDefinitionCode = globalDefinitionCode,
+    )
+    with open(f"{dumpdir}/Network.c", "w", encoding = "utf-8") as f:
+        f.write(networkImpl)
+
+    input_header = _generate_tilelang_vectors_header("testInput", list(test_inputs or []))
+    with open(f"{dumpdir}/testinputs.h", "w", encoding = "utf-8") as f:
+        f.write(input_header)
+
+    output_header = _generate_tilelang_vectors_header("testOutput", list(test_outputs or []))
+    with open(f"{dumpdir}/testoutputs.h", "w", encoding = "utf-8") as f:
+        f.write(output_header)
+
+    if shutil.which("clang-format"):
+        clang_format = "{BasedOnStyle: llvm, IndentWidth: 2, ColumnLimit: 160}"
+        os.system(f'clang-format -i --style="{clang_format}" {dumpdir}/Network.c')
+        os.system(f'clang-format -i --style="{clang_format}" {dumpdir}/Network.h')
+        os.system(f'clang-format -i --style="{clang_format}" {dumpdir}/testoutputs.h')
+        os.system(f'clang-format -i --style="{clang_format}" {dumpdir}/testinputs.h')

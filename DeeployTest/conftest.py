@@ -79,7 +79,7 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "deeploy_internal: mark test as internal Deeploy test (state serialization, extensions, transformations)")
-
+    config.addinivalue_line("markers", "tilelang: mark test as a TileLang test")
     # Configure logging based on verbosity
     verbosity = config.option.verbose
     if verbosity >= 3:

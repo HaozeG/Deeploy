@@ -39,3 +39,27 @@ if (flex_is_dm_core()) {
     ${name} = (${structDict.typeName}) ${str(structDict)};
 }
 """)
+
+# ---------------------------------------------------------------------------
+# DynamicBuffer templates — used by SoftHierDynamicBuffer (single unified
+# buffer class).  _memoryLevel is set by the TilelangVisitor based on the
+# TVM buffer scope: 'HBM' for PrimFunc params, 'L1' for alloc_fragment.
+# ---------------------------------------------------------------------------
+
+SoftHierDynamicInitTemplate = NodeTemplate("""\
+% if _memoryLevel == 'L1':
+${type.typeName} ${name} __attribute__((section(".l1")));
+% else:
+${type.typeName} ${name} __attribute__((section(".hbm")));
+% endif
+""")
+
+SoftHierDynamicAllocTemplate = NodeTemplate("""
+if (flex_is_dm_core()) {
+    % if _memoryLevel == "L1":
+    ${name} = (${type.typeName}) flex_l1_malloc(${size});\n
+    % else:
+    ${name} = (${type.typeName}) flex_hbm_malloc(${size});\n
+    % endif
+}
+""")
