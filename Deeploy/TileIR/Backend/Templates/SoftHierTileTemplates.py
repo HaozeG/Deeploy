@@ -45,7 +45,6 @@ if (flex_is_dm_core()) {
     flex_dma_async_1d(_dst_l1, _src_hbm, ${nbytes});
     flex_dma_async_wait_all();
 }
-flex_intra_cluster_sync();
 """
 
 TileLoadTemplate = NodeTemplate(TileLoadTemplateStr)
@@ -69,7 +68,6 @@ if (flex_is_dm_core()) {
     flex_dma_async_1d(_dst_hbm, _src_l1, ${nbytes});
     flex_dma_async_wait_all();
 }
-flex_intra_cluster_sync();
 """
 
 TileStoreTemplate = NodeTemplate(TileStoreTemplateStr)
@@ -89,7 +87,6 @@ if (flex_is_dm_core()) {
     flex_dma_async_1d(_dst_l1, _src_l1, ${nbytes});
     flex_dma_async_wait_all();
 }
-flex_intra_cluster_sync();
 """
 
 TileCopyTemplate = NodeTemplate(TileCopyTemplateStr)
@@ -107,7 +104,6 @@ if (flex_is_dm_core()) {
     flex_dma_async_1d((uint64_t)(uintptr_t)${buf}, zomem(0), ${nbytes});
     flex_dma_async_wait_all();
 }
-flex_intra_cluster_sync();
 """
 
 TileFillTemplate = NodeTemplate(TileFillTemplateStr)
@@ -144,7 +140,6 @@ TileReduceTemplateStr = r"""
         ((${dtype}*)${dst})[_oi] = _acc;
     }
 }
-flex_intra_cluster_sync();
 """
 
 TileReduceTemplate = NodeTemplate(TileReduceTemplateStr)
@@ -196,7 +191,6 @@ TileEltwiseTemplateStr = r"""
         ((${dtype}*)${dst})[${loop_var}] = (${dtype})(${src_expr});
     }
 }
-flex_intra_cluster_sync();
 """
 
 TileEltwiseTemplate = NodeTemplate(TileEltwiseTemplateStr)
@@ -248,12 +242,31 @@ TileSyncTemplate = NodeTemplate(TileSyncTemplateStr)
 #   cluster_id : Optional[int]
 # ---------------------------------------------------------------------------
 
-TileAllocTemplateStr = r"""
-// TileAlloc: ${name}  (${nbytes} bytes in L1)
+TileAllocTemplateStr = r"""<%
+_cm = context.get('cluster_map', None)
+_bie = context.get('block_id_expr', None)
+if _cm is not None and _bie is not None:
+    _n = len(_cm)
+    _ternary = " : ".join("(_bid == %d) ? (1U << %d)" % (i, c) for i, c in enumerate(_cm))
+    _ternary += " : 0U"
+%>// TileAlloc: ${name}  (${nbytes} bytes in L1)
 static volatile uintptr_t _addr_${name} = 0;
+% if _cm is not None and _bie is not None:
+{
+    uint32_t _bid = (${_bie}) % ${_n};
+    if (flex_is_first_core() && ((1U << flex_get_cluster_id()) & (${_ternary}))) {
+        _addr_${name} = (uintptr_t)flex_l1_malloc(${nbytes});
+    }
+}
+% elif cluster_id is not None:
+if (flex_is_first_core() && flex_get_cluster_id() == ${cluster_id}) {
+    _addr_${name} = (uintptr_t)flex_l1_malloc(${nbytes});
+}
+% else:
 if (flex_is_first_core()) {
     _addr_${name} = (uintptr_t)flex_l1_malloc(${nbytes});
 }
+% endif
 flex_intra_cluster_sync();
 ${dtype}* ${name} = (${dtype}*)(uintptr_t)_addr_${name};
 """
@@ -268,12 +281,31 @@ TileAllocTemplate = NodeTemplate(TileAllocTemplateStr)
 #   cluster_id : Optional[int]
 # ---------------------------------------------------------------------------
 
-TileFreeTemplateStr = r"""
-// TileFree: ${name}
+TileFreeTemplateStr = r"""<%
+_cm = context.get('cluster_map', None)
+_bie = context.get('block_id_expr', None)
+if _cm is not None and _bie is not None:
+    _n = len(_cm)
+    _ternary = " : ".join("(_bid == %d) ? (1U << %d)" % (i, c) for i, c in enumerate(_cm))
+    _ternary += " : 0U"
+%>// TileFree: ${name}
 flex_intra_cluster_sync();
+% if _cm is not None and _bie is not None:
+{
+    uint32_t _bid = (${_bie}) % ${_n};
+    if (flex_is_first_core() && ((1U << flex_get_cluster_id()) & (${_ternary}))) {
+        flex_l1_free((void*)(uintptr_t)${name});
+    }
+}
+% elif cluster_id is not None:
+if (flex_is_first_core() && flex_get_cluster_id() == ${cluster_id}) {
+    flex_l1_free((void*)(uintptr_t)${name});
+}
+% else:
 if (flex_is_first_core()) {
     flex_l1_free((void*)(uintptr_t)${name});
 }
+% endif
 flex_intra_cluster_sync();
 """
 

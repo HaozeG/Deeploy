@@ -38,28 +38,15 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(os.path.dirname(__file__))
 
-from typing import Optional
+from typing import List, Optional
 
 from Deeploy.DeeployTypes import NetworkContext, ExecutionBlock
 from Deeploy.TileIR.Frontend.TilelangVisitor import TilelangVisitor
+from Deeploy.TileIR.IR.CollectivePrimitives import ClusterGroupRegistry
+from Deeploy.TileIR.IR.HardwareBinding import CollectiveBackend, HardwareBinding, SoftHierCollectiveBackend
+from Deeploy.TileIR.IR.ParallelPasses import CollectiveLoweringPass, GroupAwareBarrierPass
 from Deeploy.Targets.SoftHier.Platform import SoftHierDynamicBuffer
 from testUtils.codeGenerate import generateTilelangSoftHierTestNetwork
-
-# ---------------------------------------------------------------------------
-# SoftHier includes for generated Network.c
-# ---------------------------------------------------------------------------
-
-_SOFTHIER_INCLUDES = """\
-#include "flex_l1_malloc.h"
-#include "flex_dma_async.h"
-#include "flex_intra_cluster_sync.h"
-#include "flex_group_barrier_api.h"
-#include "flex_cluster_arch.h"
-#include "flex_libfp16.h"
-#include <stdint.h>
-#include <string.h>
-"""
-
 
 def _make_softhier_ctxt(name: str = "DeeployNetwork") -> NetworkContext:
     """Create a NetworkContext configured for SoftHier with DynamicBuffer."""
@@ -76,6 +63,7 @@ def _make_softhier_ctxt(name: str = "DeeployNetwork") -> NetworkContext:
 def compile_tilelang_to_softhier(jit_fn,
                                   *tir_args,
                                   cluster_id: Optional[int] = None,
+                                  cluster_ids: Optional[List[int]] = None,
                                   network_name: str = "DeeployNetwork",
                                   **tir_kwargs) -> str:
     """Compile a TileLang jit function to a SoftHier Network.c body string.
@@ -104,16 +92,96 @@ def compile_tilelang_to_softhier(jit_fn,
     """
     # parse TileLang function to get the PrimFunc
     primfunc = jit_fn.get_tir(*tir_args, **tir_kwargs)
-    # PrimFunc -> TileBinding pipeline
+    # PrimFunc -> TileBinding 
     ctxt     = _make_softhier_ctxt(network_name)
-    visitor  = TilelangVisitor(cluster_id=cluster_id)
-    pipeline = visitor.visit_bindings(primfunc, ctxt)
-    # TileBinding pipeline -> raw ExecutionBlock
-    raw_eb: ExecutionBlock = pipeline.bind()
+    visitor  = TilelangVisitor(cluster_id=cluster_id, cluster_ids=cluster_ids)
+    tilebinding = visitor.visit_bindings(primfunc, ctxt)
+    # TileBinding -> raw ExecutionBlock
+    raw_eb: ExecutionBlock = tilebinding.bind()
     # Per-op code transformation in each TileBinding
-    ctxt, eb = pipeline.codeTransform(ctxt, raw_eb)
+    ctxt, eb = tilebinding.codeTransform(ctxt, raw_eb)
     # code generation: NetworkContext + ExecutionBlock -> C code string
     return eb.generate(ctxt)
+
+def compile_tilelang_to_softhier_parallel(
+    jit_fn,
+    *tir_args,
+    group_registry: ClusterGroupRegistry,
+    hw_binding: HardwareBinding,
+    backend: Optional[CollectiveBackend] = None,
+    cluster_policy: str = "hybrid",
+    num_clusters: Optional[int] = None,
+    cluster_ids: Optional[List[int]] = None,
+    network_name: str = "DeeployNetwork",
+    **tir_kwargs,
+) -> str:
+    """Compile a TileLang jit function with cluster-group collective support.
+
+    Extends ``compile_tilelang_to_softhier`` with group-aware barrier insertion
+    and collective lowering.
+
+    Parameters
+    ----------
+    jit_fn :
+        A ``@tilelang.jit``-decorated function with a ``.get_tir()`` method.
+    *tir_args :
+        Positional arguments forwarded to ``jit_fn.get_tir()``.
+    group_registry : ClusterGroupRegistry
+        Declared cluster groups.
+    hw_binding : HardwareBinding
+        Physical cluster-ID mapping for the groups.
+    backend : Optional[CollectiveBackend]
+        Hardware collective backend.  Defaults to ``SoftHierCollectiveBackend``.
+    cluster_policy : str
+        Cluster assignment policy for ``TilelangVisitor``.  One of
+        ``"explicit_attr"``, ``"block_idx"``, or ``"hybrid"`` (default).
+    num_clusters : Optional[int]
+        Number of physical clusters for modulo mapping from block id to
+        cluster id.  Used when ``cluster_policy`` includes block-index
+        inference.
+    network_name : str
+        Used for C symbol mangling (default ``'DeeployNetwork'``).
+    **tir_kwargs :
+        Keyword arguments forwarded to ``jit_fn.get_tir()``.
+
+    Returns
+    -------
+    str
+        Kernel body string with group-init, group barriers, and lowered
+        collectives.
+    """
+    if backend is None:
+        backend = SoftHierCollectiveBackend()
+
+    if cluster_ids is None and hw_binding is not None:
+        all_ids = set()
+        for ids in hw_binding.cluster_ids.values():
+            all_ids.update(ids)
+        cluster_ids = sorted(all_ids)
+
+    primfunc = jit_fn.get_tir(*tir_args, **tir_kwargs)
+    ctxt = _make_softhier_ctxt(network_name)
+    visitor = TilelangVisitor(
+        cluster_policy=cluster_policy,
+        num_clusters=num_clusters,
+        cluster_ids=cluster_ids,
+        group_registry=group_registry,
+    )
+    tilebinding = visitor.visit_bindings(primfunc, ctxt)
+
+    # Replace default GlobalClusterBarrierPass with group-aware pass
+    tilebinding.binding_passes = [GroupAwareBarrierPass()]
+    # Add collective lowering pass
+    tilebinding.add_binding_pass(
+        CollectiveLoweringPass(
+            registry=group_registry,
+            hw_binding=hw_binding,
+            backend=backend,
+        ))
+
+    ctxt, eb = tilebinding.codeTransform(ctxt)
+    return eb.generate(ctxt)
+
 
 def write_tilelang_softhier_test_network(
     body: str,
@@ -180,7 +248,7 @@ def _demo_live() -> None:
     )
     print("[deeployRunner] Done. Ready to compile with GCC for SoftHier.")
 
-
+# TODO: not used for now
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="TileLang → SoftHier compiler")

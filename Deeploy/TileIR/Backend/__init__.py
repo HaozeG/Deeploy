@@ -17,6 +17,19 @@ from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
     TileAllocTemplate,
     TileFreeTemplate,
 )
+from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
+    TileGroupInitTemplate,
+    TileGroupBarrierTemplate,
+    TileAllocReducerTemplate,
+    TileCollectiveReduceTemplate,
+    TileCollectiveBroadcastTemplate,
+)
+from Deeploy.TileIR.Backend.Transformations import (
+    ClusterGuardTransformationPass,
+    PassThroughTransformationPass,
+    get_tile_op_transformer,
+    register_tile_op_transformer,
+)
 
 __all__ = [
     "TileLoadTemplate",
@@ -30,4 +43,13 @@ __all__ = [
     "TileSyncTemplate",
     "TileAllocTemplate",
     "TileFreeTemplate",
+    "TileGroupInitTemplate",
+    "TileGroupBarrierTemplate",
+    "TileAllocReducerTemplate",
+    "TileCollectiveReduceTemplate",
+    "TileCollectiveBroadcastTemplate",
+    "ClusterGuardTransformationPass",
+    "PassThroughTransformationPass",
+    "get_tile_op_transformer",
+    "register_tile_op_transformer",
 ]

@@ -5,5 +5,29 @@
 """TileIR Frontend — TileLang AST → Deeploy ExecutionBlock."""
 
 from Deeploy.TileIR.Frontend.TilelangVisitor import TilelangVisitor
+from Deeploy.TileIR.IR import (
+    ClusterGroup,
+    ClusterGroupRegistry,
+    CollectiveBinding,
+    CollectiveOpSpec,
+    CollectiveLoweringPass,
+    GroupAwareBarrierPass,
+    HardwareBinding,
+    ParallelismStrategy,
+    ShardMetadata,
+    SoftHierCollectiveBackend,
+)
 
-__all__ = ["TilelangVisitor"]
+__all__ = [
+    "TilelangVisitor",
+    "ClusterGroup",
+    "ClusterGroupRegistry",
+    "CollectiveBinding",
+    "CollectiveOpSpec",
+    "CollectiveLoweringPass",
+    "GroupAwareBarrierPass",
+    "HardwareBinding",
+    "ParallelismStrategy",
+    "ShardMetadata",
+    "SoftHierCollectiveBackend",
+]

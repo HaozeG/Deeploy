@@ -45,13 +45,14 @@ from Deeploy.DeeployTypes import (
     NodeTemplate,
     _NoVerbosity,
 )
-from Deeploy.TileIR.Midend.Transformations import get_tile_op_transformer
+from Deeploy.TileIR.Backend.Transformations import get_tile_op_transformer
 
 _GLOBAL_CLUSTER_SWITCH_BARRIER_TEMPLATE = NodeTemplate("""\
 // Global barrier on cluster_id switch (${from_cluster_id} -> ${to_cluster_id})
 flex_global_barrier_xy();
 """)
 
+# TODO: consider defining as compute, memory, sync, etc op kinds
 TileOpKind = Literal[
     "alloc",
     "free",
@@ -67,6 +68,13 @@ TileOpKind = Literal[
     "sync",
     "comment",
 ]
+
+
+_BARRIER_TRANSPARENT_OP_KINDS = {
+    "for_open",
+    "for_close",
+    "comment",
+}
 
 
 @dataclass
@@ -125,6 +133,10 @@ class GlobalClusterBarrierPass(TileBindingPass):
         prev_seen = False
 
         for binding in bindings:
+            if binding.op_kind in _BARRIER_TRANSPARENT_OP_KINDS:
+                transformed.append(binding)
+                continue
+
             current_cluster_id = binding.operator_representation.get("cluster_id", None)
             if prev_seen and current_cluster_id != prev_cluster_id:
                 transformed.append(

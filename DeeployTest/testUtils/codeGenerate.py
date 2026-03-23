@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import os
 import shutil
 from typing import List, Optional, Sequence, Tuple
@@ -333,17 +334,59 @@ def _generate_tilelang_vectors_header(var_prefix: str, arrays: Sequence[np.ndarr
         ctype = _tilelang_numpy_dtype_to_ctype(flat.dtype)
         var_name = f"{var_prefix}Vector{idx}"
         names.append(var_name)
-        elems = ", ".join(_tilelang_numpy_to_c_literal(v) for v in flat)
+        if flat.dtype == np.float16:
+            # Upcast to float32 and emit float32_t literals so main.c uses the
+            # ISFLOAT32=1 path, which checks whether the source is in L1 or HBM
+            # before DMAing.  The ISFLOAT32=0 DMA path does not perform this
+            # check and causes a L1->L1 DMA that leaks memory on the simulator.
+            ctype = "float32_t"
+            elems = ", ".join(f"{float(v)}f" for v in flat.astype(np.float32))
+        else:
+            elems = ", ".join(_tilelang_numpy_to_c_literal(v) for v in flat)
         retStr += f"{ctype} {var_name}[] = {{{elems}}};\n"
 
     retStr += f"void* {var_prefix}Vector[{len(names)}] = " + "{" + ", ".join(names) + "};\n"
     return retStr
 
 
+@dataclasses.dataclass
+class TilelangIOBuffer:
+    """Descriptor for one I/O buffer in a TileLang network."""
+    name: str     # C variable name matching the TVM PrimFunc param
+    c_dtype: str  # C type string, e.g. "fp16"
+    nbytes: int   # allocation size in bytes
+    is_input: bool  # True → input, False → output
+
+
+_DEFAULT_TILELANG_INCLUDES = [
+    "flex_alloc_api.h",
+    "flex_runtime_api.h",
+    "flex_redmule_api.h",
+    "flex_dma_api.h",
+    "flex_group_barrier_api.h",
+    "flex_types.h",
+    "flex_printf_api.h",
+    "DeeploySoftHierMath.h",
+]
+
+
 def generateTilelangSoftHierNetworkHeader(
-    functionSignature: str = "void tilelang_main(fp16* A, fp16* B, fp16* C)"
+    input_bufs: Optional[Sequence["TilelangIOBuffer"]] = None,
+    output_bufs: Optional[Sequence["TilelangIOBuffer"]] = None,
+    functionSignature: Optional[str] = None,
 ) -> str:
-    return f"""
+    in_bufs = list(input_bufs or [])
+    out_bufs = list(output_bufs or [])
+    all_bufs = in_bufs + out_bufs
+
+    # Metadata arrays
+    n_in = len(in_bufs)
+    n_out = len(out_bufs)
+    in_bytes_list = ", ".join(str(b.nbytes) for b in in_bufs) if in_bufs else ""
+    out_bytes_list = ", ".join(str(b.nbytes) for b in out_bufs) if out_bufs else ""
+    # Legacy fallback: if functionSignature is provided without buf descriptors
+    if functionSignature is not None and input_bufs is None and output_bufs is None:
+        return f"""
 #ifndef __DEEPLOY_TILELANG_SOFTHIER_HEADER__
 #define __DEEPLOY_TILELANG_SOFTHIER_HEADER__
 
@@ -355,61 +398,168 @@ def generateTilelangSoftHierNetworkHeader(
 #endif
 """
 
+    return f"""\
+#ifndef __DEEPLOY_TILELANG_SOFTHIER_HEADER__
+#define __DEEPLOY_TILELANG_SOFTHIER_HEADER__
+
+#include <stdint.h>
+#include "flex_types.h"
+
+void RunNetwork(uint32_t core_id, uint32_t numThreads);
+void InitNetwork(uint32_t core_id, uint32_t numThreads);
+
+static const uint32_t DeeployNetwork_num_inputs = {n_in};
+extern void    *DeeployNetwork_inputs[];
+static const uint32_t DeeployNetwork_inputs_bytes[{max(n_in, 1)}] = {{{in_bytes_list}}};
+static const uint32_t DeeployNetwork_num_outputs = {n_out};
+extern void    *DeeployNetwork_outputs[];
+
+static const uint32_t DeeployNetwork_outputs_bytes[{max(n_out, 1)}] = {{{out_bytes_list}}};
+
+#endif
+"""
+
 
 def generateTilelangSoftHierNetworkImplementation(
     tilelangBody: str,
-    functionSignature: str = "void tilelang_main(fp16* A, fp16* B, fp16* C)",
+    input_bufs: Optional[Sequence["TilelangIOBuffer"]] = None,
+    output_bufs: Optional[Sequence["TilelangIOBuffer"]] = None,
+    functionSignature: Optional[str] = None,
     includeList: Optional[Sequence[str]] = None,
     deployer: Optional[NetworkDeployer] = None,
     bufferInitializationCode: Optional[str] = None,
     globalDefinitionCode: Optional[str] = None,
 ) -> str:
-    resolved_includes = list(includeList) if includeList is not None else [
-        "flex_alloc_api.h",
-        "flex_runtime_api.h",
-        "flex_redmule_api.h",
-        "flex_dma_api.h",
-        "flex_group_barrier_api.h",
-        "flex_types.h",
-        "flex_printf_api.h",
-        "DeeploySoftHierMath.h",
-    ]
+    resolved_includes = list(includeList) if includeList is not None else list(_DEFAULT_TILELANG_INCLUDES)
 
     includeStr = ""
     for include in resolved_includes:
         includeStr += f'#include "{include}"\n'
-    includeStr += "#include \"Network.h\"\n"
+    includeStr += '#include "Network.h"\n'
     includeStr += "#include <stdint.h>\n"
     includeStr += "#include <string.h>\n"
 
-    # If snippets are not provided explicitly, derive them from the deployer.
-    resolved_buffer_init = bufferInitializationCode
-    resolved_global_defs = globalDefinitionCode
+    # Legacy path: no buf descriptors provided
+    if input_bufs is None and output_bufs is None:
+        resolved_buffer_init = bufferInitializationCode
+        resolved_global_defs = globalDefinitionCode
 
-    if deployer is not None:
+        if deployer is not None:
+            if resolved_buffer_init is None:
+                resolved_buffer_init = deployer.generateBufferInitializationCode()
+            if resolved_global_defs is None:
+                resolved_global_defs = deployer.generateGlobalDefinitionCode()
+
         if resolved_buffer_init is None:
-            resolved_buffer_init = deployer.generateBufferInitializationCode()
+            resolved_buffer_init = ""
         if resolved_global_defs is None:
-            resolved_global_defs = deployer.generateGlobalDefinitionCode()
+            resolved_global_defs = ""
 
-    if resolved_buffer_init is None:
-        resolved_buffer_init = ""
-    if resolved_global_defs is None:
-        resolved_global_defs = ""
-
-    return f"""{includeStr}
+        sig = functionSignature or "void tilelang_main(void)"
+        return f"""{includeStr}
 {resolved_buffer_init}
 {resolved_global_defs}
-{functionSignature} {{
+{sig} {{
 {tilelangBody}
 }}
 """
+
+    # New path: generate SoftHier-convention Network.c from buf descriptors
+    in_bufs = list(input_bufs or [])
+    out_bufs = list(output_bufs or [])
+    all_bufs = in_bufs + out_bufs
+
+    # HBM global pointer declarations
+    hbm_decls = "\n".join(
+        f'{b.c_dtype}* {b.name} __attribute__((section(".hbm")));' for b in all_bufs)
+
+    # Metadata arrays
+    n_in = len(in_bufs)
+    n_out = len(out_bufs)
+
+    in_bytes_list = ", ".join(str(b.nbytes) for b in in_bufs) if in_bufs else ""
+    out_bytes_list = ", ".join(str(b.nbytes) for b in out_bufs) if out_bufs else ""
+
+    in_zeros = ", ".join(["0"] * n_in) if n_in else ""
+    out_zeros = ", ".join(["0"] * n_out) if n_out else ""
+
+    meta = f"""\
+void    *DeeployNetwork_inputs[{max(n_in, 1)}] = {{{in_zeros}}};
+
+void    *DeeployNetwork_outputs[{max(n_out, 1)}] = {{{out_zeros}}};"""
+
+    # InitNetwork: cluster 0 / dm_core allocates HBM buffers
+    hbm_allocs = "\n        ".join(
+        f'{b.name} = ({b.c_dtype}*)flex_hbm_malloc({b.nbytes});' for b in all_bufs)
+    in_assigns = "\n    ".join(
+        f"DeeployNetwork_inputs[{i}] = (void*){b.name};" for i, b in enumerate(in_bufs))
+    out_assigns = "\n    ".join(
+        f"DeeployNetwork_outputs[{i}] = (void*){b.name};" for i, b in enumerate(out_bufs))
+
+    init_fn = f"""\
+void InitNetwork(__attribute__((unused)) uint32_t core_id,
+                 __attribute__((unused)) uint32_t numThreads) {{
+  if (flex_get_cluster_id() == 0) {{
+    if (flex_is_dm_core()) {{
+      {hbm_allocs}
+    }}
+    flex_intra_cluster_sync();
+    {in_assigns}
+    {out_assigns}
+  }}
+}}"""
+
+    run_fn = f"""\
+void RunNetwork(__attribute__((unused)) uint32_t core_id,
+                __attribute__((unused)) uint32_t numThreads) {{
+{tilelangBody}
+}}"""
+
+    return f"""{includeStr}
+
+{hbm_decls}
+
+{meta}
+
+{init_fn}
+
+{run_fn}
+"""
+
+
+def _generate_tilelang_outputs_header(arrays: Sequence[np.ndarray], c_dtype: str = "fp16") -> str:
+    """Generate testoutputs.h with OUTPUTTYPE macros and testOutputVector arrays."""
+    retStr = f"#define OUTPUTTYPE {c_dtype}\n"
+    retStr += "#define ISFLOAT32 1\n"
+    retStr += "#define ISOUTPUTFLOAT 0\n"
+
+    names = []
+    for idx, arr in enumerate(arrays):
+        flat = np.asarray(arr).reshape(-1)
+        ctype = _tilelang_numpy_dtype_to_ctype(flat.dtype)
+        var_name = f"testOutputVector{idx}"
+        names.append(var_name)
+        if flat.dtype == np.float16:
+            # Upcast to float32_t so main.c reads expected values as float32
+            # (ISFLOAT32=1 verification branch: expected = ((float32_t*)...)[i]).
+            ctype = "float32_t"
+            elems = ", ".join(f"{float(v)}f" for v in flat.astype(np.float32))
+        else:
+            elems = ", ".join(_tilelang_numpy_to_c_literal(v) for v in flat)
+        retStr += f"{ctype} {var_name}[] = {{{elems}}};\n"
+
+    retStr += f"void* testOutputVector[{max(len(names), 1)}] = " + "{"
+    retStr += ", ".join(names) if names else "0"
+    retStr += "};\n"
+    return retStr
 
 
 def generateTilelangSoftHierTestNetwork(
     tilelangBody: str,
     dumpdir: str,
-    functionSignature: str = "void tilelang_main(fp16* A, fp16* B, fp16* C)",
+    input_bufs: Optional[Sequence["TilelangIOBuffer"]] = None,
+    output_bufs: Optional[Sequence["TilelangIOBuffer"]] = None,
+    functionSignature: Optional[str] = None,
     test_inputs: Optional[Sequence[np.ndarray]] = None,
     test_outputs: Optional[Sequence[np.ndarray]] = None,
     includeList: Optional[Sequence[str]] = None,
@@ -419,12 +569,18 @@ def generateTilelangSoftHierTestNetwork(
 ) -> None:
     os.makedirs(dumpdir, exist_ok = True)
 
-    networkHeader = generateTilelangSoftHierNetworkHeader(functionSignature)
+    networkHeader = generateTilelangSoftHierNetworkHeader(
+        input_bufs = input_bufs,
+        output_bufs = output_bufs,
+        functionSignature = functionSignature,
+    )
     with open(f"{dumpdir}/Network.h", "w", encoding = "utf-8") as f:
         f.write(networkHeader)
 
     networkImpl = generateTilelangSoftHierNetworkImplementation(
         tilelangBody,
+        input_bufs = input_bufs,
+        output_bufs = output_bufs,
         functionSignature = functionSignature,
         includeList = includeList,
         deployer = deployer,
@@ -438,7 +594,12 @@ def generateTilelangSoftHierTestNetwork(
     with open(f"{dumpdir}/testinputs.h", "w", encoding = "utf-8") as f:
         f.write(input_header)
 
-    output_header = _generate_tilelang_vectors_header("testOutput", list(test_outputs or []))
+    # Generate testoutputs.h with OUTPUTTYPE macros if output_bufs provided
+    if output_bufs is not None:
+        out_dtype = output_bufs[0].c_dtype if output_bufs else "fp16"
+        output_header = _generate_tilelang_outputs_header(list(test_outputs or []), c_dtype = out_dtype)
+    else:
+        output_header = _generate_tilelang_vectors_header("testOutput", list(test_outputs or []))
     with open(f"{dumpdir}/testoutputs.h", "w", encoding = "utf-8") as f:
         f.write(output_header)
 
