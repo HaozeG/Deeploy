@@ -27,53 +27,88 @@ i.e. all clusters execute the operation).
 from Deeploy.DeeployTypes import NodeTemplate
 
 # ---------------------------------------------------------------------------
-# TileLoad — HBM → L1 DMA transfer
+# TileBlockPreamble — hoisted cluster-map guard variables for a tile iteration.
+#
+# Emitted ONCE at the start of the innermost kernel block body, before any
+# TileAlloc / operation.  Declares ``_bid`` (block-index modulo group size) and
+# ``_cluster_active`` (bitmask test result for this cluster) as loop-body-scoped
+# locals so every subsequent guard can reuse them without recomputation.
 #
 # OperatorRepresentation keys:
-#   src        : str  — name of the HBM-side TileBuffer (PrimFunc param)
-#   dst        : str  — name of the L1-side TileBuffer  (alloc_fragment)
-#   nbytes     : int  — transfer size in bytes
-#   src_offset : int  — byte offset into src (0 if no offset)
-#   cluster_id : Optional[int]
+#   cluster_map    : List[int] — physical cluster IDs, one per block
+#   block_id_expr  : str       — C expression for the flat block index
+# ---------------------------------------------------------------------------
+
+TileBlockPreambleTemplateStr = r"""<%
+_cm = context.get('cluster_map', None)
+_bie = context.get('block_id_expr', None)
+if _cm is not None and _bie is not None:
+    _n = len(_cm)
+    _ternary = " : ".join("(_bid == %d) ? (1U << %d)" % (i, c) for i, c in enumerate(_cm))
+    _ternary += " : 0U"
+%>
+% if _cm is not None and _bie is not None:
+// cluster-map preamble: compute once per tile iteration
+uint32_t _bid = (${_bie}) % ${_n};
+uint32_t _cluster_active = (1U << flex_get_cluster_id()) & (${_ternary});
+if (!_cluster_active) continue;
+% endif
+"""
+
+TileBlockPreambleTemplate = NodeTemplate(TileBlockPreambleTemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileLoad — HBM → L1 DMA transfer (2D strided)
+#
+# OperatorRepresentation keys:
+#   src               : str  — name of the HBM-side TileBuffer (PrimFunc param)
+#   dst               : str  — name of the L1-side TileBuffer  (alloc_fragment)
+#   nbytes            : int  — total transfer size in bytes
+#   row_bytes         : int  — bytes per row of the tile
+#   num_rows          : int  — number of rows in the tile
+#   src_stride_bytes  : int  — byte stride between rows in the HBM source
+#   src_offset        : int  — byte offset into src (0 if no offset)
+#   cluster_id        : Optional[int]
 # ---------------------------------------------------------------------------
 
 TileLoadTemplateStr = r"""
-// TileLoad: HBM -> L1  (${src} -> ${dst}, ${nbytes} bytes)
+// TileLoad: HBM -> L1  (${src} -> ${dst}, ${num_rows} x ${row_bytes} bytes)
 if (flex_is_dm_core()) {
     uint64_t _src_hbm = (uint64_t)(uintptr_t)((char*)${src} + ${src_offset});
     uint64_t _dst_l1  = (uint64_t)(uintptr_t)${dst};
-    flex_dma_async_1d(_dst_l1, _src_hbm, ${nbytes});
-    flex_dma_async_wait_all();
+    flex_dma_sync_2d(_dst_l1, _src_hbm, ${row_bytes}, ${row_bytes}, ${src_stride_bytes}, ${num_rows});
 }
 """
 
 TileLoadTemplate = NodeTemplate(TileLoadTemplateStr)
 
 # ---------------------------------------------------------------------------
-# TileStore — L1 → HBM DMA transfer
+# TileStore — L1 → HBM DMA transfer (2D strided)
 #
 # OperatorRepresentation keys:
-#   src        : str  — name of L1 buffer
-#   dst        : str  — name of HBM buffer
-#   dst_offset : int  — byte offset into dst
-#   nbytes     : int
-#   cluster_id : Optional[int]
+#   src               : str  — name of L1 buffer
+#   dst               : str  — name of HBM buffer
+#   dst_offset        : int  — byte offset into dst
+#   nbytes            : int  — total transfer size in bytes
+#   row_bytes         : int  — bytes per row of the tile
+#   num_rows          : int  — number of rows in the tile
+#   dst_stride_bytes  : int  — byte stride between rows in the HBM destination
+#   cluster_id        : Optional[int]
 # ---------------------------------------------------------------------------
 
 TileStoreTemplateStr = r"""
-// TileStore: L1 -> HBM  (${src} -> ${dst}, ${nbytes} bytes)
+// TileStore: L1 -> HBM  (${src} -> ${dst}, ${num_rows} x ${row_bytes} bytes)
 if (flex_is_dm_core()) {
     uint64_t _dst_hbm = (uint64_t)(uintptr_t)((char*)${dst} + ${dst_offset});
     uint64_t _src_l1  = (uint64_t)(uintptr_t)${src};
-    flex_dma_async_1d(_dst_hbm, _src_l1, ${nbytes});
-    flex_dma_async_wait_all();
+    flex_dma_sync_2d(_dst_hbm, _src_l1, ${row_bytes}, ${dst_stride_bytes}, ${row_bytes}, ${num_rows});
 }
 """
 
 TileStoreTemplate = NodeTemplate(TileStoreTemplateStr)
 
 # ---------------------------------------------------------------------------
-# TileCopy — L1 → L1 memcpy (same memory space)
+# TileCopy — L1 → L1 memcpy (same memory space, always contiguous)
 #
 # OperatorRepresentation keys:
 #   src, dst, nbytes, cluster_id
@@ -84,8 +119,7 @@ TileCopyTemplateStr = r"""
 if (flex_is_dm_core()) {
     uint64_t _dst_l1 = (uint64_t)(uintptr_t)${dst};
     uint64_t _src_l1 = (uint64_t)(uintptr_t)${src};
-    flex_dma_async_1d(_dst_l1, _src_l1, ${nbytes});
-    flex_dma_async_wait_all();
+    flex_dma_sync_2d(_dst_l1, _src_l1, ${nbytes}, ${nbytes}, ${nbytes}, 1);
 }
 """
 
@@ -101,8 +135,7 @@ TileCopyTemplate = NodeTemplate(TileCopyTemplateStr)
 TileFillTemplateStr = r"""
 // TileFill: fill ${buf} with ${val}  (${nbytes} bytes) (now only supports zero-fill)
 if (flex_is_dm_core()) {
-    flex_dma_async_1d((uint64_t)(uintptr_t)${buf}, zomem(0), ${nbytes});
-    flex_dma_async_wait_all();
+    flex_dma_sync_2d((uint64_t)(uintptr_t)${buf}, zomem(0), ${nbytes}, ${nbytes}, 0, 1);
 }
 """
 
@@ -156,7 +189,7 @@ TileReduceTemplate = NodeTemplate(TileReduceTemplateStr)
 TileGemmTemplateStr = r"""
 // TileGemm: RedMule GEMM  C = A x B (+ C) with M=${M}, N=${N}, K=${K}
 if (flex_is_first_core()) {
-    flex_redmule_config((uint16_t)${M}, (uint16_t)${N}, (uint16_t)${K});
+    flex_redmule_config((uint16_t)${M}, (uint16_t)${K}, (uint16_t)${N});
     flex_redmule_trigger(
         (uint32_t)(uintptr_t)${A},
         (uint32_t)(uintptr_t)${B},
@@ -245,21 +278,14 @@ TileSyncTemplate = NodeTemplate(TileSyncTemplateStr)
 TileAllocTemplateStr = r"""<%
 _cm = context.get('cluster_map', None)
 _bie = context.get('block_id_expr', None)
-if _cm is not None and _bie is not None:
-    _n = len(_cm)
-    _ternary = " : ".join("(_bid == %d) ? (1U << %d)" % (i, c) for i, c in enumerate(_cm))
-    _ternary += " : 0U"
 %>// TileAlloc: ${name}  (${nbytes} bytes in L1)
 static volatile uintptr_t _addr_${name} = 0;
 % if _cm is not None and _bie is not None:
-{
-    uint32_t _bid = (${_bie}) % ${_n};
-    if (flex_is_first_core() && ((1U << flex_get_cluster_id()) & (${_ternary}))) {
-        _addr_${name} = (uintptr_t)flex_l1_malloc(${nbytes});
-    }
+if (flex_is_first_core()) {
+    _addr_${name} = (uintptr_t)flex_l1_malloc(${nbytes});
 }
 % elif cluster_id is not None:
-if (flex_is_first_core() && flex_get_cluster_id() == ${cluster_id}) {
+if (flex_get_cluster_id() == ${cluster_id} && flex_is_first_core()) {
     _addr_${name} = (uintptr_t)flex_l1_malloc(${nbytes});
 }
 % else:
@@ -284,21 +310,13 @@ TileAllocTemplate = NodeTemplate(TileAllocTemplateStr)
 TileFreeTemplateStr = r"""<%
 _cm = context.get('cluster_map', None)
 _bie = context.get('block_id_expr', None)
-if _cm is not None and _bie is not None:
-    _n = len(_cm)
-    _ternary = " : ".join("(_bid == %d) ? (1U << %d)" % (i, c) for i, c in enumerate(_cm))
-    _ternary += " : 0U"
 %>// TileFree: ${name}
-flex_intra_cluster_sync();
 % if _cm is not None and _bie is not None:
-{
-    uint32_t _bid = (${_bie}) % ${_n};
-    if (flex_is_first_core() && ((1U << flex_get_cluster_id()) & (${_ternary}))) {
-        flex_l1_free((void*)(uintptr_t)${name});
-    }
+if (flex_is_first_core()) {
+    flex_l1_free((void*)(uintptr_t)${name});
 }
 % elif cluster_id is not None:
-if (flex_is_first_core() && flex_get_cluster_id() == ${cluster_id}) {
+if (flex_get_cluster_id() == ${cluster_id} && flex_is_first_core()) {
     flex_l1_free((void*)(uintptr_t)${name});
 }
 % else:

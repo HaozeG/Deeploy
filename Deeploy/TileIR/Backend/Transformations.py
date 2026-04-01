@@ -47,19 +47,11 @@ _CLUSTER_GUARD_CLOSE = """\
 """
 
 _CLUSTER_MAP_GUARD_OPEN = """\
-<%
-_n = len(cluster_map)
-_ternary = " : ".join("(_bid == %d) ? (1U << %d)" % (i, c) for i, c in enumerate(cluster_map))
-_ternary += " : 0U"
-%>{
-    uint32_t CID = flex_get_cluster_id();
-    uint32_t _bid = (${block_id_expr}) % ${_n};
-    if ((1U << CID) & (${_ternary})) {
+if (_cluster_active) {
 """
 
 _CLUSTER_MAP_GUARD_CLOSE = """\
-    } // end cluster-map guard
-}
+} // end cluster-map guard
 """
 
 _GROUP_MEMBERSHIP_GUARD_OPEN = """\
@@ -130,13 +122,12 @@ class ClusterGuardTransformationPass(CodeTransformationPass):
             cluster_map = operator_representation.get("cluster_map", None) or metadata.get("cluster_map", None)
             block_id_expr = operator_representation.get("block_id_expr", None) or metadata.get("block_id_expr", None)
             if cluster_map is not None and block_id_expr is not None:
-                # Promote to top-level so Mako guard templates can access them
+                # Promote to top-level so Mako templates can access cluster_map/block_id_expr.
+                # No per-op _cluster_active guard needed: the block preamble's
+                # `if (!_cluster_active) continue;` already excludes inactive clusters.
                 operator_representation["cluster_map"] = cluster_map
                 operator_representation["block_id_expr"] = block_id_expr
-                template_source = snippet.template.template._source
-                guarded_template = NodeTemplate(
-                    _CLUSTER_MAP_GUARD_OPEN + template_source + _CLUSTER_MAP_GUARD_CLOSE)
-                transformed.addRight(guarded_template, operator_representation)
+                transformed.addRight(snippet.template, operator_representation)
                 continue
 
             # Standard single-cluster guard
@@ -198,6 +189,11 @@ register_tile_op_transformer("alloc_reducer", _default_tile_op_transformer())
 # alloc/free embed their own cluster guards in the template body
 register_tile_op_transformer("alloc", _passthrough_transformer())
 register_tile_op_transformer("free", _passthrough_transformer())
+# block_preamble declares _bid/_cluster_active once per tile block; no guard needed
+register_tile_op_transformer("block_preamble", _passthrough_transformer())
 # sync (flex_intra_cluster_sync) must be called by ALL cores in a cluster —
 # wrapping it in a cluster guard would cause a deadlock.
 register_tile_op_transformer("sync", _passthrough_transformer())
+# pipelined for-loop open/close brackets: no cluster guard needed
+register_tile_op_transformer("pipelined_for_open", _passthrough_transformer())
+register_tile_op_transformer("pipelined_for_close", _passthrough_transformer())

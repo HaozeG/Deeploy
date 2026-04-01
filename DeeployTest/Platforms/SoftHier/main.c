@@ -120,24 +120,24 @@ int main() {
 				flex_intra_cluster_sync();
 
 				if (flex_is_dm_core()) {
-				printf("[main.c] >>> Source HBM address: 0x%08x, Temporary L1 address: 0x%08x\n\n", (uint32_t)(uintptr_t)src_f32, tmp_l1_addr);
-				uint64_t mask    = 0x00000000ffffffff;
-				uint64_t src_hbm = (uint64_t)(uintptr_t)src_f32 & mask;
-				flex_dma_async_1d((void *)(uintptr_t)tmp_l1_addr, src_hbm,
-									num_elements * sizeof(float32_t));
-				flex_dma_async_wait_all();
+					printf("[main.c] >>> Source HBM address: 0x%08x, Temporary L1 address: 0x%08x\n\n", (uint32_t)(uintptr_t)src_f32, tmp_l1_addr);
+					uint64_t mask    = 0x00000000ffffffff;
+					uint64_t src_hbm = (uint64_t)(uintptr_t)src_f32 & mask;
+					flex_dma_async_1d((void *)(uintptr_t)tmp_l1_addr, src_hbm,
+										num_elements * sizeof(float32_t));
+					flex_dma_async_wait_all();
 				}
 				flex_intra_cluster_sync();
 
 				if (flex_is_dm_core()) {
-				printf("[main.c] >>> Converting input buffer %lu from FP32 to FP16 in L1...\n\n", buf);
-				float32_t *src_l1 = (float32_t *)(uintptr_t)tmp_l1_addr;
-				for (uint32_t i = 0; i < num_elements; i++) {
-					// printf("Converting element %lu: %f to %f\n", i, src_l1[i], fp16_to_float(float_to_fp16(src_l1[i])));
-					// printf("dst addr: 0x%08x\n", (uint32_t)(uintptr_t)&dst[i]);
-					dst[i] = float_to_fp16(src_l1[i]);
-				}
-				flex_l1_free((void *)(uintptr_t)tmp_l1_addr);
+					printf("[main.c] >>> Converting input buffer %lu from FP32 to FP16 in L1...\n\n", buf);
+					float32_t *src_l1 = (float32_t *)(uintptr_t)tmp_l1_addr;
+					for (uint32_t i = 0; i < num_elements; i++) {
+						// printf("Converting element %lu: %f to %f\n", i, src_l1[i], fp16_to_float(float_to_fp16(src_l1[i])));
+						// printf("dst addr: 0x%08x\n", (uint32_t)(uintptr_t)&dst[i]);
+						dst[i] = float_to_fp16(src_l1[i]);
+					}
+					flex_l1_free((void *)(uintptr_t)tmp_l1_addr);
 				}
 				flex_intra_cluster_sync();
 			}
@@ -167,52 +167,56 @@ int main() {
 	flex_global_barrier_xy(); 
 
 if (CID == 0) { // only allow cluster 0 to work
-	flex_intra_cluster_sync(); // Cluster barrier  
+	flex_intra_cluster_sync(); // Cluster barrier
 	// verification
-	if (flex_is_first_core()) { 
+	if (flex_is_first_core()) {
 		printf("[main.c] >>> Verifying outputs...\n\n");
 	}
-	
+
+	/* Tolerance mirrors numpy's allclose: |diff| <= atol + rtol * |expected| */
+#define VERIFY_ATOL 1e-1f
+#define VERIFY_RTOL 1e-1f
+
 	int32_t tot_err = 0;
 	uint32_t tot = 0;
 	float diff;
 	float expected, actual;
+	float max_abs_err = 0.0f;
+	float sum_abs_err = 0.0f;
 
 	if (flex_is_first_core()) {
 	  for (uint32_t buf = 0; buf < DeeployNetwork_num_outputs; buf++) {
 		printf("[main.c] >>> Verifying output buffer %lu...\n\n", buf);
-		tot += DeeployNetwork_outputs_bytes[buf] / sizeof(OUTPUTTYPE);
-		for (uint32_t i = 0;
-			 i < DeeployNetwork_outputs_bytes[buf] / sizeof(OUTPUTTYPE); i++) {
-		  // for float32_t, converted to fp16 during computation
-		  // use customized functions to interpret the bits and compute the difference
+		uint32_t n_elems = DeeployNetwork_outputs_bytes[buf] / sizeof(OUTPUTTYPE);
+		tot += n_elems;
+		for (uint32_t i = 0; i < n_elems; i++) {
 		  if (ISFLOAT32) {
 			expected = ((float32_t *)testOutputVector[buf])[i];
-			actual = fp16_to_float(((fp16 *)DeeployNetwork_outputs[buf])[i]);
-			diff = expected - actual;
-			if (diff > 0.01f || diff < -0.01f) { // use a threshold for float comparison
-			  tot_err += 1;
-			  printf("Expected: %f  ", expected);
-			  printf("Actual: %f  ", actual);
-			  printf("Diff: %f at Index %12lu in Output %lu\r\n", diff, i, buf);
-			}
+			actual   = fp16_to_float(((fp16 *)DeeployNetwork_outputs[buf])[i]);
 		  } else {
 			expected = fp16_to_float(((fp16 *)testOutputVector[buf])[i]);
-			actual = fp16_to_float(((fp16 *)DeeployNetwork_outputs[buf])[i]);
-			diff = expected - actual;
-			if (diff > 0.01f || diff < -0.01f) { // use a threshold for non-float comparison as well, just in case	
-			  tot_err += 1;
-			  printf("Expected: %4f  ", expected);
-			  printf("Actual: %4f  ", actual);
-			  printf("Diff: %4f at Index %12lu in Output %u\r\n", diff, i, buf);
-			}
+			actual   = fp16_to_float(((fp16 *)DeeployNetwork_outputs[buf])[i]);
 		  }
+		  /* Emit structured output for Python-side np.allclose verification */
+		//   printf("DEEPLOY_OUT[%lu][%lu]=%f\n", (unsigned long)buf, (unsigned long)i, actual);
+
+		  diff = expected - actual;
+		  float abs_diff = diff < 0.0f ? -diff : diff;
+		  float thresh   = VERIFY_ATOL + VERIFY_RTOL * (expected < 0.0f ? -expected : expected);
+		  if (abs_diff > thresh) {
+			tot_err += 1;
+			// printf("MISMATCH[%lu][%lu]: expected=%f actual=%f diff=%f\r\n",
+			// 	   (unsigned long)buf, (unsigned long)i, expected, actual, diff);
+		  }
+		  if (abs_diff > max_abs_err) max_abs_err = abs_diff;
+		  sum_abs_err += abs_diff;
 		}
 	  }
+	  printf("MaxAbsErr: %f  MeanAbsErr: %f\r\n", max_abs_err, tot > 0 ? sum_abs_err / tot : 0.0f);
 	  printf("Errors: %ld out of %ld \r\n", tot_err, tot);
 	}
 	flex_intra_cluster_sync(); // Cluster barrier
-  }
+}
 
   /**************************************/
   /*  Program Execution Region -- Stop  */

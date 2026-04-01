@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 from Deeploy.Logging import DEFAULT_LOGGER as log
 from testUtils.core.execution import build_binary, run_simulation
+from testUtils.pytestRunner import verify_numeric_outputs
 
 # ---------------------------------------------------------------------------
 # Guard: skip the whole module when TVM / TileLang are not available.
@@ -685,7 +686,7 @@ class TestBackwardCompatibility:
         B = T.empty((64,), T.float16)
         code = compile_tilelang_to_softhier(simple_copy, A, B, cluster_id=0)
         assert isinstance(code, str)
-        assert "flex_dma_async_1d" in code
+        assert "flex_dma_sync_2d" in code
         # No group primitives should appear
         assert "grid_sync_group_init" not in code
         assert "GridSyncGroupInfo" not in code
@@ -807,19 +808,25 @@ class TestEndToEndGroupCompilation:
             B: T.Tensor((K, N), dtype)
             C: T.Tensor((M, N), dtype)
 
+            # stating the tiling rule
             with T.Kernel(T.ceildiv(M, BM), T.ceildiv(N, BN)) as (bx, by):
                 A_local = T.alloc_fragment((BM, BK), dtype)
                 B_local = T.alloc_fragment((BK, BN), dtype)
-                C_local = T.alloc_fragment((BM, BN), dtype)
-                C_local_accum = T.alloc_reducer((BM, BN), dtype, "sum")
-                T.clear(C_local)
-                T.clear(C_local_accum)
-                T.copy(A[bx * BM, 0], A_local)
-                T.copy(B[0, by * BN], B_local)
-                T.gemm(A_local, B_local, C_local)
-                T.copy(C_local, C[bx * BM, by * BN])
+                C_local = T.alloc_fragment((BM, BN), collective)
 
+                with T.attr("anno", "cluster_group", "tp_group"):
+                    T.clear(C_local)    
+                    
+                    for bk in T.Parallel(T.ceildiv(K, BK)):
+                        T.copy(A[bx * BM, bk*BK], A_local)  
+                        T.copy(B[bk*BK, by * BN], B_local)
+                        T.gemm(A_local, B_local, C_local)   
+
+                        T.allreduce(C_local)
+                    
+                    T.copy(C_local, C[bx * BM, by * BN])
         return tp_gemm
+ 
 
     @staticmethod
     def _build_dp_gemm_kernel():
@@ -842,14 +849,16 @@ class TestEndToEndGroupCompilation:
             C = T.empty((M, N), dtype)
 
             with T.Kernel(T.ceildiv(M, BM), T.ceildiv(N, BN)) as (bx, by):
+                A_local = T.alloc_fragment((BM, BK), dtype)
+                B_local = T.alloc_fragment((BK, BN), dtype)
+                C_local = T.alloc_fragment((BM, BN), dtype)
                 with T.attr("anno", "cluster_group", "dp_group"):
-                    A_local = T.alloc_fragment((BM, BK), dtype)
-                    B_local = T.alloc_fragment((BK, BN), dtype)
-                    C_local = T.alloc_fragment((BM, BN), dtype)
                     T.clear(C_local)
-                    T.copy(A[bx * BM, 0], A_local)
-                    T.copy(B[0, by * BN], B_local)
-                    T.gemm(A_local, B_local, C_local)
+
+                    for bk in T.Pipelined(T.ceildiv(K, BK), num_stages=2):
+                        T.copy(A[bx * BM, bk * BK], A_local)
+                        T.copy(B[bk * BK, by * BN], B_local)
+                        T.gemm(A_local, B_local, C_local)
                     T.copy(C_local, C[bx * BM, by * BN])
 
             return C
@@ -874,108 +883,14 @@ class TestEndToEndGroupCompilation:
     # Tests
     # ------------------------------------------------------------------
 
-    # def test_tp_gemm_e2e_compiles(
-    #     self,
-    #     deeploy_test_dir: Path,
-    #     toolchain: str,
-    #     toolchain_dir: str,
-    #     cmake_args: list,
-    # ) -> None:
-    #     """TP GEMM: 2-cluster tensor-parallel group — Network.c must compile."""
-    #     import tilelang.language as T
-    #     from Deeploy.TileIR.IR import (
-    #         ClusterGroup,
-    #         ClusterGroupRegistry,
-    #         HardwareBinding,
-    #         ParallelismStrategy,
-    #     )
-    #     from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
-    #     NUM_CLUSTERS = 4  # TP/DP tests need at least 2 clusters
-    #     from testUtils.codeGenerate import TilelangIOBuffer, generateTilelangSoftHierTestNetwork
-    #     from testUtils.core import configure_cmake
-    #     from testUtils.pytestRunner import create_test_config
-
-    #     # Multi-tile grid: M > BM, N > BN so bx/by loop over multiple tiles.
-    #     M, K, N = 128, 64, 128
-    #     BM, BK, BN = 64, 32, 64
-    #     elem_bytes = 2  # sizeof(fp16)
-
-    #     tp_gemm = self._build_tp_gemm_kernel()
-    #     A = T.empty((M, K), T.float16)
-    #     B = T.empty((K, N), T.float16)
-    #     C = T.empty((M, N), T.float16)
-
-    #     registry = ClusterGroupRegistry([
-    #         ClusterGroup("tp_row", [0, 1], ParallelismStrategy.TP)
-    #     ])
-    #     hw_binding = HardwareBinding({"tp_row": [0, 1]})
-
-    #     body = compile_tilelang_to_softhier_parallel(
-    #         tp_gemm, A, B, C,
-    #         BM=BM, BN=BN, BK=BK,
-    #         group_registry=registry,
-    #         hw_binding=hw_binding,
-    #         cluster_policy="block_idx",
-    #         num_clusters=NUM_CLUSTERS,
-    #     )
-    #     assert isinstance(body, str) and len(body) > 0
-    #     assert "for (int" in body  # block-index for-loop was emitted
-
-    #     # Reference data (full M x N output)
-    #     rng = np.random.default_rng(0)
-    #     A_np = rng.standard_normal((M, K)).astype(np.float16)
-    #     B_np = rng.standard_normal((K, N)).astype(np.float16)
-    #     C_ref = (A_np @ B_np).astype(np.float16)
-
-    #     input_bufs = [
-    #         TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16", nbytes=M * K * elem_bytes, is_input=True),
-    #         TilelangIOBuffer(name="DeeployNetwork_B", c_dtype="fp16", nbytes=K * N * elem_bytes, is_input=True),
-    #     ]
-    #     output_bufs = [
-    #         TilelangIOBuffer(name="DeeployNetwork_C", c_dtype="fp16", nbytes=M * N * elem_bytes, is_input=False),
-    #     ]
-
-    #     cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
-    #     config = create_test_config(
-    #         test_name="Tilelang/tp_gemm",
-    #         platform="SoftHier",
-    #         simulator="gvsoc",
-    #         deeploy_test_dir=deeploy_test_dir,
-    #         toolchain=toolchain,
-    #         toolchain_dir=toolchain_dir,
-    #         cmake_args=cmake_extra,
-    #         tiling=False,
-    #     )
-
-    #     gen_dir = Path(config.gen_dir)
-    #     gen_dir.mkdir(parents=True, exist_ok=True)
-    #     generateTilelangSoftHierTestNetwork(
-    #         tilelangBody=body,
-    #         dumpdir=str(gen_dir),
-    #         input_bufs=input_bufs,
-    #         output_bufs=output_bufs,
-    #         test_inputs=[A_np, B_np],
-    #         test_outputs=[C_ref],
-    #     )
-
-    #     configure_cmake(config)
-    #     build_binary(config)
-    #     result = run_simulation(config)
-
-    #     assert result.success, (
-    #         f"TP GEMM simulation failed: {result.error_count} errors "
-    #         f"out of {result.total_count}\n{result.stdout}"
-    #     )
-    
-    
-    def test_dp_gemm_e2e_compiles(
+    def test_tp_gemm_e2e_compiles(
         self,
         deeploy_test_dir: Path,
         toolchain: str,
         toolchain_dir: str,
         cmake_args: list,
     ) -> None:
-        """DP GEMM: 2-cluster data-parallel (independent tiles) — Network.c must compile."""
+        """TP GEMM: 2-cluster tensor-parallel group — Network.c must compile."""
         import tilelang.language as T
         from Deeploy.TileIR.IR import (
             ClusterGroup,
@@ -983,40 +898,44 @@ class TestEndToEndGroupCompilation:
             HardwareBinding,
         )
         from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
-        NUM_CLUSTERS = 16  # cluster IDs go up to 15
+        NUM_CLUSTERS = 16
         from testUtils.codeGenerate import TilelangIOBuffer, generateTilelangSoftHierTestNetwork
         from testUtils.core import configure_cmake
         from testUtils.pytestRunner import create_test_config
 
-        M, K, N = 128, 32, 128
-        BM, BK, BN = 32, 32, 32
+        # Multi-tile grid: M > BM, N > BN so bx/by loop over multiple tiles.
+        M, K, N = 128, 64, 128
+        BM, BK, BN = 128, 32, 128
         elem_bytes = 2  # sizeof(fp16)
 
-        dp_gemm = self._build_dp_gemm_kernel()
+        tp_gemm = self._build_tp_gemm_kernel()
         A = T.empty((M, K), T.float16)
         B = T.empty((K, N), T.float16)
+        C = T.empty((M, N), T.float16)
 
+        tp_row_cluster = [0, 1]
         registry = ClusterGroupRegistry([
-            ClusterGroup("dp_group", [0, 2, 5, 7, 8, 10, 13, 15])
+            ClusterGroup("tp_row", tp_row_cluster, root_instance=0)
         ])
-        hw_binding = HardwareBinding({"dp_group": [0, 2, 5, 7, 8, 10, 13, 15]})
+        hw_binding = HardwareBinding({"tp_row": tp_row_cluster})
 
         body = compile_tilelang_to_softhier_parallel(
-            dp_gemm, A, B,
+            tp_gemm, A, B, C,
             BM=BM, BN=BN, BK=BK,
             group_registry=registry,
             hw_binding=hw_binding,
             cluster_policy="block_idx",
-            # cluster_ids auto-derived from hw_binding
+            num_clusters=NUM_CLUSTERS,
         )
         assert isinstance(body, str) and len(body) > 0
         assert "for (int" in body  # block-index for-loop was emitted
 
-        # Reference data — full M x N output (all tiles covered by block grid)
+        # Reference data (full M x N output)
         rng = np.random.default_rng(1)
         A_np = rng.standard_normal((M, K)).astype(np.float16)
         B_np = rng.standard_normal((K, N)).astype(np.float16)
-        C_ref = (A_np @ B_np).astype(np.float16)
+        from softhier_golden.fma import matrix_multiply_with_bittrue_fma
+        C_ref = matrix_multiply_with_bittrue_fma(A_np, B_np, np.zeros((M, N))).astype(np.float16)
         input_bufs = [
             TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16", nbytes=M * K * elem_bytes, is_input=True),
             TilelangIOBuffer(name="DeeployNetwork_B", c_dtype="fp16", nbytes=K * N * elem_bytes, is_input=True),
@@ -1027,7 +946,7 @@ class TestEndToEndGroupCompilation:
 
         cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
         config = create_test_config(
-            test_name="Tilelang/dp_gemm",
+            test_name="Tilelang/tp_gemm",
             platform="SoftHier",
             simulator="gvsoc",
             deeploy_test_dir=deeploy_test_dir,
@@ -1051,8 +970,103 @@ class TestEndToEndGroupCompilation:
         configure_cmake(config)
         build_binary(config)
         result = run_simulation(config)
+        verify_numeric_outputs(result, C_ref.flatten().reshape(1, -1), atol=3e-1, rtol=3e-2)
 
         assert result.success, (
-            f"DP GEMM simulation failed: {result.error_count} errors "
+            f"TP GEMM simulation failed: {result.error_count} errors "
             f"out of {result.total_count}\n{result.stdout}"
         )
+    
+    
+    # def test_dp_gemm_e2e_compiles(
+    #     self,
+    #     deeploy_test_dir: Path,
+    #     toolchain: str,
+    #     toolchain_dir: str,
+    #     cmake_args: list,
+    # ) -> None:
+    #     """DP GEMM: 2-cluster data-parallel (independent tiles) — Network.c must compile."""
+    #     import tilelang.language as T
+    #     from Deeploy.TileIR.IR import (
+    #         ClusterGroup,
+    #         ClusterGroupRegistry,
+    #         HardwareBinding,
+    #     )
+    #     from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+    #     NUM_CLUSTERS = 16  # cluster IDs go up to 15
+    #     from testUtils.codeGenerate import TilelangIOBuffer, generateTilelangSoftHierTestNetwork
+    #     from testUtils.core import configure_cmake
+    #     from testUtils.pytestRunner import create_test_config
+
+    #     M, K, N = 256, 128, 256
+    #     BM, BK, BN = 128, 16, 128
+    #     elem_bytes = 2  # sizeof(fp16)
+
+    #     dp_gemm = self._build_dp_gemm_kernel()
+    #     A = T.empty((M, K), T.float16)
+    #     B = T.empty((K, N), T.float16)
+
+    #     registry = ClusterGroupRegistry([
+    #         ClusterGroup("dp_group", [0, 1, 2, 3], root_instance=0)
+    #         # ClusterGroup("dp_group", [0, 2, 5, 7, 8, 10, 13, 15], root_instance=0)
+    #     ])
+    #     # hw_binding = HardwareBinding({"dp_group": [0, 2, 5, 7, 8, 10, 13, 15]})
+    #     hw_binding = HardwareBinding({"dp_group": [0, 1, 2, 3]})
+
+    #     body = compile_tilelang_to_softhier_parallel(
+    #         dp_gemm, A, B,
+    #         BM=BM, BN=BN, BK=BK,
+    #         group_registry=registry,
+    #         hw_binding=hw_binding,
+    #         cluster_policy="block_idx",
+    #         # cluster_ids auto-derived from hw_binding
+    #     )
+    #     assert isinstance(body, str) and len(body) > 0
+    #     assert "for (int" in body  # block-index for-loop was emitted
+
+    #     # Reference data — full M x N output (all tiles covered by block grid)
+    #     rng = np.random.default_rng(1)
+    #     A_np = rng.standard_normal((M, K)).astype(np.float16)
+    #     B_np = rng.standard_normal((K, N)).astype(np.float16)
+    #     from softhier_golden.fma import matrix_multiply_with_bittrue_fma
+    #     C_ref = matrix_multiply_with_bittrue_fma(A_np, B_np, np.zeros((M, N))).astype(np.float16)
+    #     input_bufs = [
+    #         TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16", nbytes=M * K * elem_bytes, is_input=True),
+    #         TilelangIOBuffer(name="DeeployNetwork_B", c_dtype="fp16", nbytes=K * N * elem_bytes, is_input=True),
+    #     ]
+    #     output_bufs = [
+    #         TilelangIOBuffer(name="DeeployNetwork_C", c_dtype="fp16", nbytes=M * N * elem_bytes, is_input=False),
+    #     ]
+
+    #     cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
+    #     config = create_test_config(
+    #         test_name="Tilelang/dp_gemm",
+    #         platform="SoftHier",
+    #         simulator="gvsoc",
+    #         deeploy_test_dir=deeploy_test_dir,
+    #         toolchain=toolchain,
+    #         toolchain_dir=toolchain_dir,
+    #         cmake_args=cmake_extra,
+    #         tiling=False,
+    #     )
+
+    #     gen_dir = Path(config.gen_dir)
+    #     gen_dir.mkdir(parents=True, exist_ok=True)
+    #     generateTilelangSoftHierTestNetwork(
+    #         tilelangBody=body,
+    #         dumpdir=str(gen_dir),
+    #         input_bufs=input_bufs,
+    #         output_bufs=output_bufs,
+    #         test_inputs=[A_np, B_np],
+    #         test_outputs=[C_ref],
+    #     )
+
+    #     configure_cmake(config)
+    #     build_binary(config)
+    #     result = run_simulation(config)
+    #     verify_numeric_outputs(result, C_ref.flatten().reshape(1, -1), atol=3e-1, rtol=3e-2)
+
+    #     assert result.success, (
+    #         f"DP GEMM simulation failed: {result.error_count} errors "
+    #         f"out of {result.total_count}\n{result.stdout}"
+    #     )

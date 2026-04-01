@@ -4,12 +4,13 @@
 
 from .config import DeeployTestConfig
 from .execution import build_binary, configure_cmake, generate_network, run_complete_test, run_simulation
-from .output_parser import TestResult
+from .output_parser import TestResult, parse_numeric_outputs
 from .paths import get_test_paths
 
 __all__ = [
     'DeeployTestConfig',
     'TestResult',
+    'parse_numeric_outputs',
     'get_test_paths',
     'generate_network',
     'configure_cmake',

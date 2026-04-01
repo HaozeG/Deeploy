@@ -45,6 +45,7 @@ from Deeploy.TileIR.Frontend.TilelangVisitor import TilelangVisitor
 from Deeploy.TileIR.IR.CollectivePrimitives import ClusterGroupRegistry
 from Deeploy.TileIR.IR.HardwareBinding import CollectiveBackend, HardwareBinding, SoftHierCollectiveBackend
 from Deeploy.TileIR.IR.ParallelPasses import CollectiveLoweringPass, GroupAwareBarrierPass
+from Deeploy.TileIR.Midend.TileBindings import SoftwarePipelinePass
 from Deeploy.Targets.SoftHier.Platform import SoftHierDynamicBuffer
 from testUtils.codeGenerate import generateTilelangSoftHierTestNetwork
 
@@ -169,8 +170,9 @@ def compile_tilelang_to_softhier_parallel(
     )
     tilebinding = visitor.visit_bindings(primfunc, ctxt)
 
-    # Replace default GlobalClusterBarrierPass with group-aware pass
-    tilebinding.binding_passes = [GroupAwareBarrierPass()]
+    # Replace default GlobalClusterBarrierPass with group-aware pass;
+    # keep SoftwarePipelinePass first to handle T.Pipelined(num_stages=N) loops.
+    tilebinding.binding_passes = [SoftwarePipelinePass(), GroupAwareBarrierPass()]
     # Add collective lowering pass
     tilebinding.add_binding_pass(
         CollectiveLoweringPass(

@@ -121,6 +121,7 @@ from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
     ForLoopCloseTemplate,
     ForLoopOpenTemplate,
     TileAllocTemplate,
+    TileBlockPreambleTemplate,
     TileCopyTemplate,
     TileEltwiseTemplate,
     TileFillTemplate,
@@ -859,7 +860,23 @@ class TilelangVisitor:
             )
         )
 
-        for buf in getattr(stmt, "alloc_buffers", []):
+        alloc_buffers = getattr(stmt, "alloc_buffers", [])
+
+        # Emit a block preamble (declares _bid and _cluster_active once) when:
+        # - We are in cluster-map (block_idx) mode (cluster_ids is set), AND
+        # - This block actually allocates L1 buffers (i.e. it is the innermost
+        #   kernel body block, not a bare scoping block inside the body).
+        if alloc_buffers and self.cluster_ids:
+            _, preamble_block_id_expr = self._infer_cluster_from_block_idx()
+            if preamble_block_id_expr is not None:
+                preamble_rep = {
+                    "cluster_map":   list(self.cluster_ids),
+                    "block_id_expr": preamble_block_id_expr,
+                    "cluster_id":    None,
+                }
+                self._emit_binding("block_preamble", TileBlockPreambleTemplate, preamble_rep)
+
+        for buf in alloc_buffers:
             alloc_cluster_id = block_cluster_hints.get(buf.name, cluster_id)
             self._register_local_buf(buf, alloc_cluster_id, group_id=current_group_id)
             nbytes = _prod(buf.shape) * _dtype_bytes(str(buf.dtype))
@@ -1016,8 +1033,16 @@ class TilelangVisitor:
         extent   = int(stmt.min) + int(stmt.extent) if hasattr(stmt.extent, "__int__") else str(stmt.extent)
 
         # ForKind: 0=Serial, 1=Parallel, 2=Unroll, 3=Vectorized, 4=ThreadBinding
-        # TODO: dealing with pipeline annotations if specified
         for_kind = int(stmt.kind)
+
+        # Extract num_stages from T.Pipelined annotation (if present)
+        num_stages = None
+        annotations = getattr(stmt, "annotations", {}) or {}
+        if "num_stages" in annotations:
+            try:
+                num_stages = int(annotations["num_stages"])
+            except (TypeError, ValueError):
+                pass
 
         axis_name = self._thread_axis_name(stmt, loop_var)
         prev_axis_expr = self._block_axes.get(axis_name) if axis_name is not None else None
@@ -1029,6 +1054,19 @@ class TilelangVisitor:
         # Parallel For: map to TileEltwise if body is a BufferStore
         if for_kind == 1:  # Parallel
             self._handle_parallel_for(stmt, loop_var, int(stmt.extent), cluster_id)
+        elif num_stages is not None and num_stages > 1:
+            # Pipelined For (T.Pipelined with num_stages > 1): tag with num_stages for midend
+            rep_open = {
+                "loop_var":   loop_var,
+                "min_val":    min_val,
+                "extent":     int(stmt.extent),
+                "num_stages": num_stages,
+                "cluster_id": None,
+            }
+            self._emit_binding("pipelined_for_open", ForLoopOpenTemplate, rep_open)
+            self._visit_stmt(stmt.body, cluster_id)
+            self._emit_binding("pipelined_for_close", ForLoopCloseTemplate,
+                               {"loop_var": loop_var, "num_stages": num_stages})
         else:
             # Serial: emit open/close brackets and recurse
             rep_open = {
@@ -1083,26 +1121,44 @@ class TilelangVisitor:
 
         # check for cluster_id annotation
         if src_is_hbm and not dst_is_hbm:
-            # HBM → L1: TileLoad
+            # HBM → L1: TileLoad (2D strided)
+            row_bytes, num_rows, eb = self._region_2d_params(src_region)
+            src_buf = self._global_bufs.get(src_buf_name)
+            try:
+                src_stride_bytes = int(src_buf.shape[-1]) * eb
+            except (TypeError, ValueError, AttributeError):
+                src_stride_bytes = row_bytes  # fallback: contiguous
             rep = {
-                "src":        src_buf_name,
-                "dst":        dst_buf_name,
-                "nbytes":     nbytes,
-                "src_offset": src_offset,
-                "cluster_id": resolved_cluster_id,
-                "metadata":   op_metadata,
+                "src":              src_buf_name,
+                "dst":              dst_buf_name,
+                "nbytes":           nbytes,
+                "row_bytes":        row_bytes,
+                "num_rows":         num_rows,
+                "src_stride_bytes": src_stride_bytes,
+                "src_offset":       src_offset,
+                "cluster_id":       resolved_cluster_id,
+                "metadata":         op_metadata,
             }
             self._emit_binding("load", TileLoadTemplate, rep)
 
         elif not src_is_hbm and dst_is_hbm:
-            # L1 → HBM: TileStore
+            # L1 → HBM: TileStore (2D strided)
+            row_bytes, num_rows, eb = self._region_2d_params(src_region)
+            dst_buf = self._global_bufs.get(dst_buf_name)
+            try:
+                dst_stride_bytes = int(dst_buf.shape[-1]) * eb
+            except (TypeError, ValueError, AttributeError):
+                dst_stride_bytes = row_bytes  # fallback: contiguous
             rep = {
-                "src":        src_buf_name,
-                "dst":        dst_buf_name,
-                "nbytes":     nbytes,
-                "dst_offset": dst_offset,
-                "cluster_id": resolved_cluster_id,
-                "metadata":   op_metadata,
+                "src":              src_buf_name,
+                "dst":              dst_buf_name,
+                "nbytes":           nbytes,
+                "row_bytes":        row_bytes,
+                "num_rows":         num_rows,
+                "dst_stride_bytes": dst_stride_bytes,
+                "dst_offset":       dst_offset,
+                "cluster_id":       resolved_cluster_id,
+                "metadata":         op_metadata,
             }
             self._emit_binding("store", TileStoreTemplate, rep)
 
@@ -1516,6 +1572,32 @@ class TilelangVisitor:
                     self._global_bufs.get(buf_name))
         dtype    = str(buf.dtype) if buf else "float16"
         return n * _dtype_bytes(dtype)
+
+    def _region_2d_params(self, region):
+        """Return (row_bytes, num_rows, elem_bytes) for a region.
+
+        For a 2-D tile of shape (R, C): row_bytes = C * elem_bytes, num_rows = R.
+        For a 1-D region: row_bytes = nbytes, num_rows = 1.
+        """
+        args = list(region.args) if hasattr(region, "args") else []
+        ndim = self._region_ndim(region)
+        dims = args[2: 2 + ndim]
+
+        buf_name = self._region_buf_name(region)
+        buf = self._local_bufs.get(buf_name) or self._global_bufs.get(buf_name)
+        eb = _dtype_bytes(str(buf.dtype) if buf else "float16")
+
+        if len(dims) >= 2:
+            try:
+                row_bytes = int(dims[-1]) * eb
+                num_rows = 1
+                for d in dims[:-1]:
+                    num_rows *= int(d)
+                return row_bytes, num_rows, eb
+            except (TypeError, ValueError):
+                pass
+        # Fallback: treat as single contiguous row
+        return self._region_nbytes(region), 1, eb
 
     def _dense_row_major_strides(self, shape: List[int]) -> List[int]:
         """Return dense row-major element strides for a shape."""

@@ -484,9 +484,9 @@ def generateTilelangSoftHierNetworkImplementation(
     out_zeros = ", ".join(["0"] * n_out) if n_out else ""
 
     meta = f"""\
-void    *DeeployNetwork_inputs[{max(n_in, 1)}] = {{{in_zeros}}};
+void    *DeeployNetwork_inputs[{max(n_in, 1)}];
 
-void    *DeeployNetwork_outputs[{max(n_out, 1)}] = {{{out_zeros}}};"""
+void    *DeeployNetwork_outputs[{max(n_out, 1)}];"""
 
     # InitNetwork: cluster 0 / dm_core allocates HBM buffers
     hbm_allocs = "\n        ".join(

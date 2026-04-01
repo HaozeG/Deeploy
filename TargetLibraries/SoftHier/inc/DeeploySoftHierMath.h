@@ -17,7 +17,6 @@
 
 #include "DeeployBasicMath.h"
 
-#include "flex_runtime_api.h"
 #include "flex_cluster_arch.h"
 #include "flex_dma_api.h"
 #include "flex_redmule_api.h"

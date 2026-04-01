@@ -6,12 +6,16 @@ import os
 from pathlib import Path
 from typing import List, Literal, Optional
 
+import numpy as np
+
 from .core import DeeployTestConfig, build_binary, configure_cmake, get_test_paths, run_complete_test, run_simulation
+from .core.output_parser import TestResult, parse_numeric_outputs
 
 __all__ = [
     'get_worker_id',
     'create_test_config',
     'run_and_assert_test',
+    'verify_numeric_outputs',
     'build_binary',
     'configure_cmake',
     'run_simulation',
@@ -109,6 +113,41 @@ def create_test_config(
     )
 
     return config
+
+
+def verify_numeric_outputs(
+    result: TestResult,
+    expected_arrays: List[np.ndarray],
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> None:
+    """Verify simulation output values against reference arrays via ``np.allclose``.
+
+    Parses ``DEEPLOY_OUT[buf][idx]=value`` lines emitted by ``main.c`` from the
+    simulation stdout, reconstructs the actual output arrays, and compares them
+    element-wise against ``expected_arrays`` using ``np.allclose(rtol, atol)``.
+
+    Args:
+        result:          :class:`TestResult` returned by ``run_simulation`` or
+                         ``run_complete_test``.
+        expected_arrays: Reference arrays (one per output buffer).  Each array
+                         is flattened and cast to ``float32`` before comparison.
+        rtol:            Relative tolerance (default 1e-2, appropriate for fp16).
+        atol:            Absolute tolerance (default 1e-2, appropriate for fp16).
+
+    Raises:
+        AssertionError: If no ``DEEPLOY_OUT`` values were found in stdout, or if
+                        any output buffer fails ``np.allclose``.
+    """
+    actual_arrays = result.output_arrays or parse_numeric_outputs(result.stdout)
+    assert actual_arrays, "No DEEPLOY_OUT values found in simulation stdout"
+    for i, (actual, expected) in enumerate(zip(actual_arrays, expected_arrays)):
+        exp_flat = np.asarray(expected).ravel().astype(np.float32)
+        abs_err = np.abs(actual - exp_flat)
+        print(f"Output buffer {i}: max_err={np.max(abs_err):.4e}, mean_err={np.mean(abs_err):.4e}")
+        assert np.allclose(actual, exp_flat, rtol = rtol, atol = atol), (
+            f"Output buffer {i} failed np.allclose(rtol={rtol}, atol={atol}): "
+            f"max_err={np.max(abs_err):.4e}, mean_err={np.mean(abs_err):.4e}")
 
 
 def run_and_assert_test(test_name: str, config: DeeployTestConfig, skipgen: bool, skipsim: bool) -> None:
