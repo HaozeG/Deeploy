@@ -58,6 +58,27 @@ if (!_cluster_active) continue;
 TileBlockPreambleTemplate = NodeTemplate(TileBlockPreambleTemplateStr)
 
 # ---------------------------------------------------------------------------
+# TileGroupPreamble — cluster_active guard for multi-cluster groups (TP-style).
+#
+# Uses cluster_active_${group_id} declared in TileGroupContextTemplate:
+#   cluster_active = valid_grid && (this_grid_id < num_groups)
+# This mirrors SummaGEMM's "this_grid_id < summa_groups" check and correctly
+# restricts execution to the intended num_groups group instances while letting
+# unused instances skip the tile body (and the group barriers inside it).
+#
+# OperatorRepresentation keys:
+#   group_id  : str
+# ---------------------------------------------------------------------------
+
+TileGroupPreambleTemplateStr = r"""
+// group-preamble: skip tile if not in an active group instance ('${group_id}')
+if (!cluster_active_${group_id})
+  continue;
+"""
+
+TileGroupPreambleTemplate = NodeTemplate(TileGroupPreambleTemplateStr)
+
+# ---------------------------------------------------------------------------
 # TileLoad — HBM → L1 DMA transfer (2D strided)
 #
 # OperatorRepresentation keys:
@@ -244,12 +265,17 @@ ForLoopOpenTemplateStr = r"""
 for (int ${loop_var} = ${min_val}; ${loop_var} < ${extent}; ${loop_var}++) {
 """
 
+ForLoopOpenStridedTemplateStr = r"""
+for (int ${loop_var} = ${min_val}; ${loop_var} < ${extent}; ${loop_var} += ${step}) {
+"""
+
 ForLoopCloseTemplateStr = r"""
 } // end for ${loop_var}
 """
 
-ForLoopOpenTemplate  = NodeTemplate(ForLoopOpenTemplateStr)
-ForLoopCloseTemplate = NodeTemplate(ForLoopCloseTemplateStr)
+ForLoopOpenTemplate        = NodeTemplate(ForLoopOpenTemplateStr)
+ForLoopOpenStridedTemplate = NodeTemplate(ForLoopOpenStridedTemplateStr)
+ForLoopCloseTemplate       = NodeTemplate(ForLoopCloseTemplateStr)
 
 # ---------------------------------------------------------------------------
 # TileSync — software barrier between DM-core-driven DMA and compute cores.

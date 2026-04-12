@@ -10,10 +10,12 @@ from Deeploy.TileIR.IR.CollectivePrimitives import (
     CollectiveOpSpec,
     ParallelismStrategy,
     ShardMetadata,
+    TensorLayout,
 )
 from Deeploy.TileIR.IR.HardwareBinding import (
     CollectiveBackend,
     HardwareBinding,
+    HwTopology,
     SoftHierCollectiveBackend,
 )
 from Deeploy.TileIR.IR.ParallelPasses import (
@@ -28,7 +30,9 @@ __all__ = [
     "CollectiveOpSpec",
     "ParallelismStrategy",
     "ShardMetadata",
+    "TensorLayout",
     "HardwareBinding",
+    "HwTopology",
     "CollectiveBackend",
     "SoftHierCollectiveBackend",
     "CollectiveBinding",

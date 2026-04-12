@@ -196,7 +196,12 @@ class CollectiveLoweringPass(TileBindingPass):
         if self.registry is None or self.hw_binding is None or self.backend is None:
             return bindings
 
+        # Merge physical cluster IDs from hw_binding into each ClusterGroup so
+        # registry.root_cluster_for() / registry.clusters_for() work below.
+        self.hw_binding.populate_registry(self.registry)
+
         from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
+            TileGroupContextTemplate,
             TileGroupInitTemplate,
         )
 
@@ -220,7 +225,8 @@ class CollectiveLoweringPass(TileBindingPass):
                     op_name="tile_global_barrier_before_group_init",
                 ))
             for gid in ordered_groups:
-                x_dim, y_dim = self.hw_binding.grid_dims_for(gid)
+                group = self.registry.get(gid)
+                x_dim, y_dim = group.group_x, group.group_y
                 prefix.append(
                     TileBinding(
                         op_kind="group_barrier",
@@ -240,6 +246,22 @@ class CollectiveLoweringPass(TileBindingPass):
                     operator_representation={},
                     op_name="tile_global_barrier_after_group_init",
                 ))
+            # Emit TileGroupContextTemplate after the post-init barrier.
+            # num_groups is passed so cluster_active_* uses this_grid_id < num_groups
+            # (SummaGEMM pattern) to restrict execution to active group instances.
+            for gid in ordered_groups:
+                group = self.registry.get(gid)
+                prefix.append(
+                    TileBinding(
+                        op_kind="group_barrier",
+                        template=TileGroupContextTemplate,
+                        operator_representation={
+                            "group_id":   gid,
+                            "num_groups": group.num_groups,
+                            "cluster_id": None,
+                        },
+                        op_name=f"tile_group_context_{gid}",
+                    ))
 
         # Process each binding
         transformed: List[TileBinding] = []
@@ -248,7 +270,7 @@ class CollectiveLoweringPass(TileBindingPass):
                 # Patch cluster_id to root cluster
                 gid = binding.operator_representation.get("group_id")
                 if gid is not None:
-                    root_cid = self.hw_binding.root_cluster_for(gid, self.registry)
+                    root_cid = self.registry.root_cluster_for(gid)
                     binding.operator_representation["cluster_id"] = root_cid
                 transformed.append(binding)
 
@@ -256,7 +278,7 @@ class CollectiveLoweringPass(TileBindingPass):
                 # Lower to hardware bindings
                 hw_bindings = self.backend.lower(
                     binding.spec,
-                    self.hw_binding,
+                    self.hw_binding,  # still passed for strategy compat
                     self.registry,
                 )
                 # Resolve nbytes for the placeholder
@@ -272,7 +294,7 @@ class CollectiveLoweringPass(TileBindingPass):
                 # Tag group-member allocs for guard generation
                 binding.operator_representation["cluster_guard_type"] = "group_membership"
                 gid = self._group_id_of(binding)
-                cluster_ids = self.hw_binding.clusters_for(gid)
+                cluster_ids = self.registry.clusters_for(gid)
                 binding.operator_representation["group_cluster_ids"] = cluster_ids
                 transformed.append(binding)
 

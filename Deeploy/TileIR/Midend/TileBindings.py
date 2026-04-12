@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple
 
 from Deeploy.DeeployTypes import (
     CodeGenVerbosity,
@@ -47,6 +47,9 @@ from Deeploy.DeeployTypes import (
     _NoVerbosity,
 )
 from Deeploy.TileIR.Backend.Transformations import get_tile_op_transformer
+
+if TYPE_CHECKING:
+    from Deeploy.TileIR.IR.CollectivePrimitives import ClusterGroupRegistry
 
 _GLOBAL_CLUSTER_SWITCH_BARRIER_TEMPLATE = NodeTemplate("""\
 // Global barrier on cluster_id switch (${from_cluster_id} -> ${to_cluster_id})
@@ -180,7 +183,23 @@ class SoftwarePipelinePass(TileBindingPass):
     The DM core and RedMule / compute cores are distinct hardware cores inside a
     SoftHier cluster and execute concurrently between ``flex_intra_cluster_sync``
     calls.  No async DMA API is required.
+
+    When *group_registry* is provided and a pipelined scope belongs to a
+    multi-cluster group (``group_x > 1``), a **K-split** strided loop is emitted
+    instead of a plain loop:
+
+    * Prologue loads from ``bk = cluster_in_group_id_x_<gid>`` (per-cluster
+      K-offset) into stage 0.
+    * Main loop runs ``for (bk = cluster_in_group_id_x_<gid>; bk < extent;
+      bk += group_x)``.  Each cluster handles every ``group_x``-th K-block.
+    * Prefetch guard and offset use the strided step.
+
+    This fixes the 2× numerical error in TP-GEMM where without K-split both
+    clusters accumulate the full K sum, causing the allreduce to double the
+    result.
     """
+
+    group_registry: Optional["ClusterGroupRegistry"] = None
 
     def apply(self, bindings: List[TileBinding]) -> List[TileBinding]:
         # ---------------------------------------------------------------
@@ -228,6 +247,16 @@ class SoftwarePipelinePass(TileBindingPass):
         for info in scope_info.values():
             all_dup_names.update(info["load_buf_names"])
 
+        # Pre-scan: collect group_ids that have collective ops (group_collective bindings).
+        # K-split strided loops are only applied to groups with actual collectives (TP),
+        # not DP groups that happen to have group_x > 1.
+        collective_group_ids: Set[str] = set()
+        for b in bindings:
+            if b.op_kind == "group_collective":
+                gid = b.operator_representation.get("group_id")
+                if gid:
+                    collective_group_ids.add(gid)
+
         # ---------------------------------------------------------------
         # Main rewrite pass
         # ---------------------------------------------------------------
@@ -268,7 +297,8 @@ class SoftwarePipelinePass(TileBindingPass):
             # -- Rewrite pipelined for scope --
             if i in scope_info:
                 info = scope_info[i]
-                result, i = self._rewrite_scope(bindings, i, info, buf_dtypes, result)
+                result, i = self._rewrite_scope(bindings, i, info, buf_dtypes, result,
+                                                collective_group_ids)
                 continue
 
             result.append(b)
@@ -294,6 +324,49 @@ class SoftwarePipelinePass(TileBindingPass):
             return expr
         return re.sub(r'\b' + re.escape(loop_var) + r'\b', f'({replacement})', str(expr))
 
+    def _tp_group_info(self, inner_bindings: List["TileBinding"],
+                       collective_group_ids: Optional[Set[str]] = None):
+        """Detect a TP K-split group (group_x > 1) for a pipelined scope.
+
+        Detection strategy (most to least specific):
+
+        1. Scan *inner_bindings* for a ``shard_metadata.group_id`` that maps to
+           a group with ``group_x > 1`` in the registry.  This path fires when
+           the cluster_group AttrStmt wraps the For loop body.
+
+        2. Fall back to scanning the registry directly for any group with
+           ``group_x > 1`` AND a collective op in *collective_group_ids*.  This is
+           needed because TileLang's lowering only attaches the cluster_group
+           AttrStmt to the ``T.allreduce`` call, not to the surrounding For loop,
+           so inner bindings carry ``shard_metadata=None``.
+           Restricting to *collective_group_ids* prevents DP groups (group_x > 1
+           but no collectives) from incorrectly triggering K-split.
+
+        Returns ``(group_id, group_x)`` when a TP group is found,
+        or ``(None, 1)`` otherwise.
+        """
+        if self.group_registry is None:
+            return None, 1
+        # Strategy 1: shard_metadata on inner bindings (most specific)
+        for b in inner_bindings:
+            sm = b.operator_representation.get("shard_metadata")
+            if sm is None or not hasattr(sm, "group_id") or not sm.group_id:
+                continue
+            try:
+                group = self.group_registry.get(sm.group_id)
+                if group.group_x > 1:
+                    return sm.group_id, int(group.group_x)
+            except (KeyError, AttributeError):
+                pass
+        # Strategy 2: registry fallback — groups with collectives AND group_x > 1.
+        # Only match when collective_group_ids is non-empty (i.e. we have real
+        # collective info); an empty set means no collectives → no K-split.
+        if collective_group_ids:
+            for group in self.group_registry.groups:
+                if int(group.group_x) > 1 and group.group_id in collective_group_ids:
+                    return group.group_id, int(group.group_x)
+        return None, 1
+
     def _rewrite_scope(
         self,
         bindings: List[TileBinding],
@@ -301,10 +374,12 @@ class SoftwarePipelinePass(TileBindingPass):
         info: dict,
         buf_dtypes: Dict[str, str],
         result: List[TileBinding],
+        collective_group_ids: Optional[Set[str]] = None,
     ) -> Tuple[List[TileBinding], int]:
         from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
             ForLoopCloseTemplate,
             ForLoopOpenTemplate,
+            ForLoopOpenStridedTemplate,
         )
 
         num_stages = info["num_stages"]
@@ -318,6 +393,9 @@ class SoftwarePipelinePass(TileBindingPass):
                          and b.operator_representation.get("dst") in load_buf_names]
         compute_bindings = [b for b in inner if b.op_kind in ("gemm", "eltwise", "reduce")]
 
+        # Detect TP K-split: multi-cluster group along the K dimension.
+        tp_group_id, tp_stride = self._tp_group_info(inner, collective_group_ids or set())
+
         if not load_bindings or not compute_bindings:
             # Fall back to plain for-loop
             rep_open = dict(bindings[i].operator_representation)
@@ -330,40 +408,80 @@ class SoftwarePipelinePass(TileBindingPass):
                                       operator_representation={"loop_var": loop_var}))
             return result, close_idx + 1
 
-        # ---- Prologue: load stage 0 before the loop ----
+        # For TP K-split (block distribution): rank r handles bk in
+        # [r*tiles_per_rank, (r+1)*tiles_per_rank).  Prologue loads the first
+        # tile of this rank's block into _0.
+        # For non-TP: prologue loads from bk=0 into _0 (existing behaviour).
+        if tp_group_id:
+            tiles_per_rank = extent // tp_stride  # exact integer division
+            rank_var = f"cluster_in_group_id_x_{tp_group_id}"
+            tp_start_expr = f"{rank_var} * {tiles_per_rank}"
+            tp_end_expr   = f"({rank_var} + 1) * {tiles_per_rank}"
+            prologue_subst = tp_start_expr
+        else:
+            tiles_per_rank = None
+            tp_start_expr  = None
+            tp_end_expr    = None
+            prologue_subst = "0"
+
+        # ---- Prologue: load stage 0 (or cluster-specific stage) before the loop ----
         for lb in load_bindings:
             orig_dst = lb.operator_representation["dst"]
             rep = dict(lb.operator_representation)
             rep["dst"] = f"{orig_dst}_0"
-            rep["src_offset"] = self._subst_loop_var(rep.get("src_offset", 0), loop_var, "0")
+            rep["src_offset"] = self._subst_loop_var(
+                rep.get("src_offset", 0), loop_var, prologue_subst)
             result.append(TileBinding(op_kind="load", template=lb.template,
                                       operator_representation=rep))
         result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
                                   operator_representation={"cluster_id": None}))
 
         # ---- Main loop open ----
-        rep_open = {
-            "loop_var": loop_var,
-            "min_val": 0,
-            "extent": extent,
-            "cluster_id": None,
-        }
-        result.append(TileBinding(op_kind="for_open", template=ForLoopOpenTemplate,
-                                  operator_representation=rep_open))
+        if tp_group_id:
+            # TP K-split block distribution: each rank iterates over its
+            # contiguous slice [rank*tiles_per_rank, (rank+1)*tiles_per_rank).
+            rep_open = {
+                "loop_var":  loop_var,
+                "min_val":   tp_start_expr,
+                "extent":    tp_end_expr,
+                "cluster_id": None,
+            }
+            result.append(TileBinding(op_kind="for_open", template=ForLoopOpenTemplate,
+                                      operator_representation=rep_open))
+        else:
+            rep_open = {
+                "loop_var": loop_var,
+                "min_val": 0,
+                "extent": extent,
+                "cluster_id": None,
+            }
+            result.append(TileBinding(op_kind="for_open", template=ForLoopOpenTemplate,
+                                      operator_representation=rep_open))
 
         # ---- Stage pointer declarations (_cur / _nxt) ----
         stage_lines = []
         for lb in load_bindings:
             orig_dst = lb.operator_representation["dst"]
             dtype = buf_dtypes.get(orig_dst, "fp16")
-            # cur: buffer for the current iteration (already loaded in prologue or prev iter)
-            stage_lines.append(
-                f"{dtype}* {orig_dst}_cur = ({loop_var} % {num_stages} == 0) "
-                f"? {orig_dst}_0 : {orig_dst}_1;")
-            # nxt: buffer to prefetch into for the next iteration
-            stage_lines.append(
-                f"{dtype}* {orig_dst}_nxt = ({loop_var} % {num_stages} == 0) "
-                f"? {orig_dst}_1 : {orig_dst}_0;")
+            if tp_group_id:
+                # TP block distribution: alternate buffers relative to the start
+                # of this rank's range so _0 always corresponds to the prologue.
+                # (bk - rank*tiles_per_rank) % num_stages selects stage correctly
+                # regardless of which rank this cluster is.
+                stage_lines.append(
+                    f"{dtype}* {orig_dst}_cur = (({loop_var} - {tp_start_expr}) % {num_stages} == 0) "
+                    f"? {orig_dst}_0 : {orig_dst}_1;")
+                stage_lines.append(
+                    f"{dtype}* {orig_dst}_nxt = (({loop_var} - {tp_start_expr}) % {num_stages} == 0) "
+                    f"? {orig_dst}_1 : {orig_dst}_0;")
+            else:
+                # Non-TP: runtime selection between double-buffer stages.
+                stage_lines.append(
+                    f"{dtype}* {orig_dst}_cur = ({loop_var} % {num_stages} == 0) "
+                    f"? {orig_dst}_0 : {orig_dst}_1;")
+                stage_lines.append(
+                    f"{dtype}* {orig_dst}_nxt = ({loop_var} % {num_stages} == 0) "
+                    f"? {orig_dst}_1 : {orig_dst}_0;")
         stage_select_source = "\n".join(stage_lines) + "\n"
         result.append(TileBinding(
             op_kind="comment",
@@ -372,13 +490,15 @@ class SoftwarePipelinePass(TileBindingPass):
         ))
 
         # ---- Prefetch loads (DM core): load next stage, guarded ----
-        guard_expr = f"{loop_var} + 1 < {extent}"
+        # For TP block: next iteration is bk+1, guard against rank's end.
+        next_bk_expr = f"{loop_var} + 1"
+        guard_expr = f"{next_bk_expr} < {tp_end_expr}" if tp_group_id else f"{next_bk_expr} < {extent}"
         for lb in load_bindings:
             orig_dst = lb.operator_representation["dst"]
             rep = dict(lb.operator_representation)
             rep["dst"] = f"{orig_dst}_nxt"
             rep["src_offset"] = self._subst_loop_var(
-                rep.get("src_offset", 0), loop_var, f"{loop_var} + 1")
+                rep.get("src_offset", 0), loop_var, next_bk_expr)
             # Wrap load body in a guard
             inner_src = lb.template.template._source
             guarded_src = f"if ({guard_expr}) {{\n{inner_src}}}\n"
@@ -413,8 +533,15 @@ class TileBindingPipeline:
     """Ordered list of TileBindings for one TileLang PrimFunc."""
 
     bindings: List[TileBinding] = field(default_factory=list)
-    binding_passes: List[TileBindingPass] = field(
-        default_factory=lambda: [SoftwarePipelinePass(), GlobalClusterBarrierPass()])
+    group_registry: Optional["ClusterGroupRegistry"] = field(default=None, repr=False)
+    binding_passes: Optional[List[TileBindingPass]] = field(default=None)
+
+    def __post_init__(self) -> None:
+        if self.binding_passes is None:
+            self.binding_passes = [
+                SoftwarePipelinePass(group_registry=self.group_registry),
+                GlobalClusterBarrierPass(),
+            ]
 
     def add(self, binding: TileBinding) -> None:
         self.bindings.append(binding)

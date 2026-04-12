@@ -14,11 +14,15 @@ ParallelismStrategy
     Enumeration of parallelism strategies (DP, TP, SP, EP, PP).
 
 ClusterGroup
-    A named, ordered set of cluster IDs that communicate together, annotated
-    with a parallelism strategy label.
+    A strict 2-D group of clusters matching SoftHier's
+    ``grid_sync_group_init(group_x, group_y)`` primitive.  One call
+    creates ``num_groups`` parallel instances tiled across the chip.
 
 ClusterGroupRegistry
     Container of ClusterGroup objects; lookup by group_id.
+
+TensorLayout
+    Sharding annotation for a tile buffer relative to a ClusterGroup.
 
 CollectiveOpSpec
     Math-level specification of an inter-cluster collective operation.
@@ -31,16 +35,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class ParallelismStrategy(Enum):
-    """High-level parallelism strategy label.
-
-    These labels carry semantic intent for downstream analysis passes
-    (e.g. tile-reuse detection).  They do NOT alter code generation on
-    their own — that is driven by the explicit collective primitives.
-    """
+    """High-level parallelism strategy label."""
 
     DP = "data_parallel"
     TP = "tensor_parallel"
@@ -51,92 +50,222 @@ class ParallelismStrategy(Enum):
 
 @dataclass
 class ClusterGroup:
-    """A named set of clusters that communicate together.
+    """A strict 2-D group of clusters matching SoftHier's grid_sync_group_init.
+
+    One ``grid_sync_group_init(group_x, group_y)`` call produces
+    ``num_groups`` parallel group instances tiled across the physical
+    ``Px × Py`` cluster grid.  Runtime fields ``this_grid_id``,
+    ``wakeup_row_mask`` / ``wakeup_col_mask`` differentiate instances and
+    identify which clusters participate in row/column collectives.
 
     Parameters
     ----------
     group_id : str
-        Unique identifier for this group.  Matches the string used in
-        ``T.attr("anno", "cluster_group", group_id)`` annotations.
-    cluster_ids : List[int]
-        Ordered list of cluster IDs in the group.  The index of the root
-        cluster is given by ``root_instance``.
-    strategy : Optional[ParallelismStrategy]
-        Parallelism strategy label (metadata only — no automatic inference).
-        ``None`` when no strategy classification is needed.
-    root_instance : int
-        Index within ``cluster_ids`` of the root (coordinator) cluster.
-        Defaults to 0 (first cluster in the list).
+        Unique identifier.  Matches the string in ``T.attr("anno",
+        "cluster_group", group_id)`` annotations.
+    group_x : int
+        Group width  (``grid_x_dim`` in ``GridSyncGroupInfo``).
+    group_y : int
+        Group height (``grid_y_dim`` in ``GridSyncGroupInfo``).
+    num_groups : int
+        Number of group instances tiled across the physical grid.
+    axis_names : (str, str)
+        Names for the two group axes, default ``("x", "y")``.
+        Used in ``TensorLayout.axis_map`` values.
+    root_coord : (int, int)
+        ``(rx, ry)`` root rank within one group instance, default ``(0, 0)``.
+    strategy : ParallelismStrategy or None
+        Metadata-only parallelism label.
     """
 
     group_id: str
-    cluster_ids: List[int]
+    group_x: int
+    group_y: int
+    num_groups: int = 1
+    axis_names: Tuple[str, str] = ("x", "y")
+    root_coord: Tuple[int, int] = (0, 0)
     strategy: Optional[ParallelismStrategy] = None
-    root_instance: int = 0
+    physical_cluster_ids: Optional[List[int]] = None
+
+    def __post_init__(self):
+        if self.group_x < 1 or self.group_y < 1:
+            raise ValueError(
+                f"ClusterGroup '{self.group_id}': group_x and group_y must be >= 1, "
+                f"got group_x={self.group_x}, group_y={self.group_y}"
+            )
+        if self.num_groups < 1:
+            raise ValueError(
+                f"ClusterGroup '{self.group_id}': num_groups must be >= 1, "
+                f"got num_groups={self.num_groups}"
+            )
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return (self.group_x, self.group_y)
+
+    @property
+    def num_ranks_per_instance(self) -> int:
+        return self.group_x * self.group_y
+
+    @property
+    def total_clusters(self) -> int:
+        return self.num_groups * self.group_x * self.group_y
+
+    def axis_index(self, name: str) -> int:
+        if name == self.axis_names[0]:
+            return 0
+        if name == self.axis_names[1]:
+            return 1
+        raise ValueError(
+            f"ClusterGroup '{self.group_id}': axis '{name}' not found in "
+            f"axis_names={self.axis_names!r}"
+        )
+
+    def rank_of(self, rx: int, ry: int) -> int:
+        return ry * self.group_x + rx
+
+    def coord_of(self, rank: int) -> Tuple[int, int]:
+        return (rank % self.group_x, rank // self.group_x)
 
     @property
     def root_cluster_id(self) -> int:
-        """Return the actual cluster ID of the root cluster."""
-        return self.cluster_ids[self.root_instance]
+        """Row-major rank of the root within one instance."""
+        return self.rank_of(self.root_coord[0], self.root_coord[1])
+
+    @property
+    def root_physical_cluster_id(self) -> int:
+        """Physical SoC cluster ID of the root within instance 0."""
+        if self.physical_cluster_ids is not None:
+            return self.physical_cluster_ids[self.root_cluster_id]
+        return self.root_cluster_id  # logical rank as fallback
 
     @property
     def num_clusters(self) -> int:
-        """Number of clusters in this group."""
-        return len(self.cluster_ids)
+        """Alias for num_ranks_per_instance (legacy compat)."""
+        return self.num_ranks_per_instance
+
+    @property
+    def cluster_ids(self) -> List[int]:
+        """Rank indices within one instance (0..num_ranks_per_instance-1).
+
+        .. deprecated::
+            Use ``HardwareBinding.clusters_for(group_id)`` for physical IDs.
+        """
+        return list(range(self.num_ranks_per_instance))
+
+    @property
+    def root_instance(self) -> int:
+        """Row-major rank of root within one instance (legacy compat)."""
+        return self.rank_of(self.root_coord[0], self.root_coord[1])
+
+    @classmethod
+    def from_flat(
+        cls,
+        group_id: str,
+        cluster_ids: List[int],
+        strategy: Optional[ParallelismStrategy] = None,
+    ) -> "ClusterGroup":
+        """Construct a 1-D (row) group from a flat list of cluster IDs."""
+        return cls(
+            group_id=group_id,
+            group_x=len(cluster_ids),
+            group_y=1,
+            num_groups=1,
+            strategy=strategy,
+        )
 
 
 @dataclass
 class ClusterGroupRegistry:
-    """Container for a collection of ClusterGroup objects.
-
-    Parameters
-    ----------
-    groups : List[ClusterGroup]
-        All declared cluster groups.
-    """
+    """Container for a collection of ClusterGroup objects."""
 
     groups: List[ClusterGroup] = field(default_factory=list)
+    neighbor_groups: Dict[str, List[str]] = field(default_factory=dict)
 
     def get(self, group_id: str) -> ClusterGroup:
-        """Look up a group by its string ID.
-
-        Raises
-        ------
-        KeyError
-            When no group with ``group_id`` exists.
-        """
         for group in self.groups:
             if group.group_id == group_id:
                 return group
         raise KeyError(f"ClusterGroupRegistry: unknown group_id={group_id!r}")
 
+    def register(self, group: ClusterGroup) -> None:
+        """Register a new group. Silently replaces if group_id already exists."""
+        for i, g in enumerate(self.groups):
+            if g.group_id == group.group_id:
+                self.groups[i] = group
+                return
+        self.groups.append(group)
+
     def root_cluster(self, group_id: str) -> int:
-        """Return the root cluster ID for *group_id*."""
         return self.get(group_id).root_cluster_id
 
+    def root_cluster_for(self, group_id: str) -> int:
+        """Physical root cluster ID for *group_id* (uses physical_cluster_ids if set)."""
+        return self.get(group_id).root_physical_cluster_id
+
+    def clusters_for(self, group_id: str) -> Optional[List[int]]:
+        """Physical cluster IDs for *group_id*, or None if not set."""
+        return self.get(group_id).physical_cluster_ids
+
     def all_group_ids(self) -> List[str]:
-        """Return all registered group IDs."""
         return [g.group_id for g in self.groups]
 
     def contains(self, group_id: str) -> bool:
-        """Return True when *group_id* is registered."""
         for group in self.groups:
             if group.group_id == group_id:
                 return True
         return False
 
 
+@dataclass(frozen=True)
+class TensorLayout:
+    """How a tile buffer is sharded across the two axes of a ClusterGroup.
+
+    Parameters
+    ----------
+    group_id : str
+        Which cluster group this layout belongs to.
+    axis_map : Dict[int, str]
+        Maps tensor axis indices to group axis names.
+    partial : (str, str) or None
+        ``(reduce_op, axis_name)`` — marks this buffer as holding a
+        partial result awaiting reduction along ``axis_name``.
+    """
+
+    group_id: str
+    axis_map: Dict[int, str] = field(default_factory=dict)
+    partial: Optional[Tuple[str, str]] = None
+
+    @property
+    def is_sharded(self) -> bool:
+        return bool(self.axis_map)
+
+    @property
+    def is_partial(self) -> bool:
+        return self.partial is not None
+
+    def sharded_axes(self) -> List[int]:
+        return sorted(self.axis_map.keys())
+
+    def reduce_axis(self) -> Optional[str]:
+        if self.partial is not None:
+            return self.partial[1]
+        return None
+
+    def reduce_op(self) -> Optional[str]:
+        if self.partial is not None:
+            return self.partial[0]
+        return None
+
+
 @dataclass
 class CollectiveOpSpec:
     """Math-level specification of an inter-cluster collective.
 
-    Hardware lowering is performed by a ``CollectiveBackend``; this class
-    carries only the logical description.
-
     Parameters
     ----------
     op : str
-        Collective operation kind: ``"allreduce"``, ``"broadcast"``,
+        Collective operation: ``"allreduce"``, ``"broadcast"``,
         ``"scatter"``, or ``"gather"``.
     group_id : str
         The cluster group over which the collective is performed.
@@ -145,8 +274,14 @@ class CollectiveOpSpec:
     dst_buffer : str
         Name of the destination (accumulated-result) L1 buffer.
     reduce_op : str
-        Reduction operator for ``"allreduce"`` — ``"sum"``, ``"max"``,
-        or ``"min"``.  Ignored for non-reduce collectives.
+        Reduction operator for ``"allreduce"``: ``"sum"``, ``"max"``.
+    reduce_axis : str or None
+        Group axis name along which to reduce (``"x"`` or ``"y"``).
+        When ``None``, the backend uses full-group allreduce.
+    src_layout : TensorLayout or None
+        Layout annotation of the source buffer.
+    dst_layout : TensorLayout or None
+        Layout annotation of the destination buffer.
     """
 
     op: str
@@ -154,24 +289,114 @@ class CollectiveOpSpec:
     src_buffer: str
     dst_buffer: str
     reduce_op: str = "sum"
+    reduce_axis: Optional[str] = None
+    src_layout: Optional[TensorLayout] = None
+    dst_layout: Optional[TensorLayout] = None
 
 
 @dataclass
 class ShardMetadata:
-    """Lightweight per-TileBinding metadata for tile-reuse analysis.
-
-    This dataclass is stored under the ``"shard_metadata"`` key of the
-    ``operator_representation`` dict of every TileBinding that was emitted
-    within a ``cluster_group`` annotation block.
-
-    Fields
-    ------
-    group_id : Optional[str]
-        Which cluster group this operation belongs to.
-    parallelism_strategy : Optional[str]
-        Strategy label string (e.g. ``"tensor_parallel"``).  Derived from
-        the ``ParallelismStrategy`` enum value of the owning ClusterGroup.
-    """
+    """Lightweight per-TileBinding metadata for tile-reuse analysis."""
 
     group_id: Optional[str] = None
     parallelism_strategy: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Spec-string parsers (grammar owned here, matching cluster_group.py)
+# ---------------------------------------------------------------------------
+
+def parse_cluster_group_spec(spec: str, registry: "ClusterGroupRegistry") -> str:
+    """Parse a cluster_group AttrStmt value and register the group.
+
+    Handles two forms:
+    1. Bare name (legacy): ``"tp_row"`` — returns the group_id unchanged.
+    2. Full spec: ``"tp;x=2;y=1;num_groups=1;axes=tp,_;root=0,0"``
+       Parses, synthesizes a ``ClusterGroup``, registers it (if not already
+       registered), and returns the group_id.
+    """
+    spec = spec.strip('"').strip("'").strip()
+    parts = spec.split(";")
+    group_id = parts[0]
+
+    if len(parts) == 1:
+        return group_id
+
+    kv: Dict[str, str] = {}
+    for part in parts[1:]:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            kv[k.strip()] = v.strip()
+
+    group_x = int(kv.get("x", 1))
+    group_y = int(kv.get("y", 1))
+    num_groups = int(kv.get("num_groups", 1))
+
+    axes_raw = kv.get("axes", "x,y").split(",")
+    axis_names: Tuple[str, str] = (
+        axes_raw[0].strip() if len(axes_raw) > 0 else "x",
+        axes_raw[1].strip() if len(axes_raw) > 1 else "y",
+    )
+
+    root_coord: Tuple[int, int] = (0, 0)
+    if "root" in kv:
+        rc = kv["root"].split(",")
+        root_coord = (int(rc[0]), int(rc[1]) if len(rc) > 1 else 0)
+
+    strategy: Optional[ParallelismStrategy] = None
+    if "strategy" in kv:
+        stag = kv["strategy"]
+        for s in ParallelismStrategy:
+            if s.value == stag or s.name.lower() == stag.lower():
+                strategy = s
+                break
+
+    if not registry.contains(group_id):
+        group = ClusterGroup(
+            group_id=group_id,
+            group_x=group_x,
+            group_y=group_y,
+            num_groups=num_groups,
+            axis_names=axis_names,
+            root_coord=root_coord,
+            strategy=strategy,
+        )
+        registry.register(group)
+
+    return group_id
+
+
+def parse_layout_spec(spec: str, group_id: str):
+    """Parse a layout AttrStmt value into a (buf_name, TensorLayout) tuple.
+
+    Grammar::
+
+        "<buf_name>=<clause>[;<clause>...]"
+        clause := axis<N>:<axis_name>  |  partial:<op>@<axis_name>
+    """
+    spec = spec.strip('"').strip("'").strip()
+    if "=" not in spec:
+        raise ValueError(f"parse_layout_spec: expected '<name>=<clauses>', got {spec!r}")
+
+    buf_name, clauses_str = spec.split("=", 1)
+    buf_name = buf_name.strip()
+
+    axis_map: Dict[int, str] = {}
+    partial: Optional[Tuple[str, str]] = None
+
+    for clause in clauses_str.split(";"):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if clause.startswith("axis") and ":" in clause:
+            ax_part, axis_name = clause.split(":", 1)
+            ax_idx = int(ax_part[4:])
+            axis_map[ax_idx] = axis_name.strip()
+        elif clause.startswith("partial:") and "@" in clause:
+            rest = clause[len("partial:"):]
+            op_str, axis_name = rest.split("@", 1)
+            partial = (op_str.strip(), axis_name.strip())
+        else:
+            raise ValueError(f"parse_layout_spec: unrecognised clause {clause!r} in {spec!r}")
+
+    return buf_name, TensorLayout(group_id=group_id, axis_map=axis_map, partial=partial)

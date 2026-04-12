@@ -112,6 +112,9 @@ from Deeploy.TileIR.IR.CollectivePrimitives import (
     ClusterGroupRegistry,
     CollectiveOpSpec,
     ShardMetadata,
+    TensorLayout,
+    parse_cluster_group_spec,
+    parse_layout_spec,
 )
 from Deeploy.TileIR.IR.ParallelPasses import CollectiveBinding
 from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
@@ -122,6 +125,7 @@ from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
     ForLoopOpenTemplate,
     TileAllocTemplate,
     TileBlockPreambleTemplate,
+    TileGroupPreambleTemplate,
     TileCopyTemplate,
     TileEltwiseTemplate,
     TileFillTemplate,
@@ -368,6 +372,7 @@ class TilelangVisitor:
             "fill": self._handle_fill,
             "gemm_py": self._handle_gemm_py,
             "collective": self._handle_collective,
+            "allreduce": self._handle_allreduce,
             "alloc_reducer": self._handle_alloc_reducer_intrinsic,
         }
 
@@ -406,7 +411,9 @@ class TilelangVisitor:
         """
         self._ctxt = ctxt
         self._eb   = ExecutionBlock()
-        self._bindings = TileBindingPipeline()
+        # Pass group_registry so SoftwarePipelinePass can detect TP K-split groups
+        # and emit strided bk loops instead of full-K loops on every cluster.
+        self._bindings = TileBindingPipeline(group_registry=self.group_registry)
         self._global_bufs = {}
         self._local_bufs  = {}
         self._alloc_order = []
@@ -414,6 +421,8 @@ class TilelangVisitor:
         self._block_axes = {}
         self._block_extents = {}
         self._current_group_id = None
+        # Buffer-name → TensorLayout, populated by "layout" AttrStmt
+        self._buffer_layouts: Dict[str, TensorLayout] = {}
 
         # 1. Extract cluster_id from function attrs if present
         self._primfunc_cluster_id = None
@@ -466,6 +475,21 @@ class TilelangVisitor:
             group_id=self._current_group_id,
             parallelism_strategy=strategy_str,
         )
+
+    def _has_multi_cluster_group(self) -> bool:
+        """Return True if any registered group has > 1 cluster per instance (TP-style)."""
+        if self.group_registry is None:
+            return False
+        return any(g.num_ranks_per_instance > 1 for g in self.group_registry.groups)
+
+    def _primary_multi_cluster_group_id(self) -> Optional[str]:
+        """Return the group_id of the first multi-cluster group, or None."""
+        if self.group_registry is None:
+            return None
+        for g in self.group_registry.groups:
+            if g.num_ranks_per_instance > 1:
+                return g.group_id
+        return None
 
     def _infer_cluster_from_block_idx(self):
         bx = self._block_axes.get("bx")
@@ -831,7 +855,53 @@ class TilelangVisitor:
                     and str(node.attr_key) == "cluster_group"):
                 return str(node.value).strip('"').strip("'")
             node = getattr(node, "body", None)
-        return None
+
+    @staticmethod
+    def _scan_for_collective_groups(stmt) -> set:
+        """Deeply scan TIR *stmt* to find group_ids of cluster_group AttrStmts
+        that contain allreduce or collective intrinsic calls.
+
+        Returns a set of group_id strings.  Only groups that actually have
+        collective ops are included — DP groups (multi-cluster but no collectives)
+        are correctly excluded.
+        """
+        result: set = set()
+
+        def _walk(node, in_group: Optional[str] = None):
+            if node is None:
+                return
+            cls = type(node).__name__
+            if cls == "AttrStmt":
+                # Check only attr_key — NOT node.node, because T.cluster_group() uses
+                # attr(None, "cluster_group", ...) which sets node=None, not "anno".
+                if str(getattr(node, "attr_key", "")) == "cluster_group":
+                    gid = str(node.value).strip('"').strip("'").split(";")[0]
+                    _walk(getattr(node, "body", None), in_group=gid)
+                    return
+                _walk(getattr(node, "body", None), in_group)
+            elif cls == "Evaluate":
+                if in_group is not None:
+                    val = getattr(node, "value", None)
+                    if val is not None and type(val).__name__ == "Call":
+                        op_name = ""
+                        op_obj = getattr(val, "op", None)
+                        if op_obj is not None:
+                            op_name = str(getattr(op_obj, "name", "")).split(".")[-1]
+                        if op_name in ("allreduce", "collective"):
+                            result.add(in_group)
+            elif cls == "SeqStmt":
+                for s in node.seq:
+                    _walk(s, in_group)
+            elif cls == "For":
+                _walk(getattr(node, "body", None), in_group)
+            elif cls == "IfThenElse":
+                _walk(getattr(node, "then_case", None), in_group)
+                _walk(getattr(node, "else_case", None), in_group)
+            elif cls in ("Block", "BlockRealize"):
+                _walk(getattr(node, "body", None), in_group)
+
+        _walk(stmt)
+        return result
 
     def _visit_Block(self, stmt, cluster_id):
         # TODO: consider adding sync at block boundaries if needed (e.g. after a producer block before a consumer block)
@@ -862,19 +932,48 @@ class TilelangVisitor:
 
         alloc_buffers = getattr(stmt, "alloc_buffers", [])
 
-        # Emit a block preamble (declares _bid and _cluster_active once) when:
+        # Emit a block preamble (declares cluster_active / _cluster_active once) when:
         # - We are in cluster-map (block_idx) mode (cluster_ids is set), AND
         # - This block actually allocates L1 buffers (i.e. it is the innermost
         #   kernel body block, not a bare scoping block inside the body).
+        #
+        # For TP-style groups (multi-cluster AND has collective ops in the body):
+        # use TileGroupPreambleTemplate which checks
+        # cluster_active_<gid> = valid_grid && (this_grid_id < num_groups).
+        # This follows the SummaGEMM pattern and ensures ALL group members reach
+        # the group barriers inside the tile body (fixes tp_gemm deadlock).
+        #
+        # For DP groups (multi-cluster but NO collectives) or ungrouped:
+        # keep the block_idx bitmask.  This correctly handles dp_group with
+        # group_x=4 which has no collective ops and must not reference the
+        # undeclared cluster_active_dp_group variable.
         if alloc_buffers and self.cluster_ids:
-            _, preamble_block_id_expr = self._infer_cluster_from_block_idx()
-            if preamble_block_id_expr is not None:
-                preamble_rep = {
-                    "cluster_map":   list(self.cluster_ids),
-                    "block_id_expr": preamble_block_id_expr,
-                    "cluster_id":    None,
-                }
-                self._emit_binding("block_preamble", TileBlockPreambleTemplate, preamble_rep)
+            # Pre-scan body TIR to find groups that actually have collective ops.
+            collective_gids_in_body = self._scan_for_collective_groups(stmt.body)
+            tp_preamble_gid = None
+            if self.group_registry is not None:
+                for gid_candidate in collective_gids_in_body:
+                    try:
+                        grp = self.group_registry.get(gid_candidate)
+                        if grp.group_x > 1:
+                            tp_preamble_gid = gid_candidate
+                            break
+                    except KeyError:
+                        pass
+            if tp_preamble_gid is not None:
+                # TP-style group: use valid_grid + this_grid_id < num_groups guard.
+                preamble_rep = {"group_id": tp_preamble_gid, "cluster_id": None}
+                self._emit_binding("group_preamble", TileGroupPreambleTemplate, preamble_rep)
+            else:
+                # DP groups or ungrouped: use compile-time bitmask.
+                _, preamble_block_id_expr = self._infer_cluster_from_block_idx()
+                if preamble_block_id_expr is not None:
+                    preamble_rep = {
+                        "cluster_map":   list(self.cluster_ids),
+                        "block_id_expr": preamble_block_id_expr,
+                        "cluster_id":    None,
+                    }
+                    self._emit_binding("block_preamble", TileBlockPreambleTemplate, preamble_rep)
 
         for buf in alloc_buffers:
             alloc_cluster_id = block_cluster_hints.get(buf.name, cluster_id)
@@ -942,12 +1041,32 @@ class TilelangVisitor:
                 except (KeyError, TypeError, ValueError):
                     pass
             elif attr_key == "cluster_group":
-                # Enter a cluster_group annotation block
-                group_id = str(stmt.value).strip('"').strip("'")
+                # Parse cluster_group spec — handles both bare "name" and full
+                # "name;x=2;y=1;num_groups=1;axes=tp,_" forms.
+                raw_spec = str(stmt.value).strip('"').strip("'")
+                registry = self.group_registry
+                if registry is None:
+                    registry = ClusterGroupRegistry()
+                    self.group_registry = registry
+                group_id = parse_cluster_group_spec(raw_spec, registry)
                 prev_group_id = self._current_group_id
                 self._current_group_id = group_id
                 self._visit_stmt(stmt.body, cluster_id)
                 self._current_group_id = prev_group_id
+                return
+            elif attr_key == "layout":
+                # Parse layout annotation: "buf_name=clause[;clause...]"
+                raw_spec = str(stmt.value).strip('"').strip("'")
+                current_gid = self._current_group_id
+                if current_gid is None:
+                    print(f"[TilelangVisitor] Warning: T.tile_layout outside cluster_group block: {raw_spec!r}")
+                else:
+                    try:
+                        buf_name, layout = parse_layout_spec(raw_spec, current_gid)
+                        self._buffer_layouts[buf_name] = layout
+                    except (ValueError, KeyError) as exc:
+                        print(f"[TilelangVisitor] Warning: tile_layout parse error: {exc}")
+                self._visit_stmt(stmt.body, cluster_id)
                 return
 
         # Handle thread_extent AttrStmt for blockIdx axes —
@@ -1421,6 +1540,8 @@ class TilelangVisitor:
             reduce_op=reduce_op,
         )
         shard_meta = self._make_shard_metadata()
+        if shard_meta is None and group_id is not None:
+            shard_meta = ShardMetadata(group_id=group_id)
         rep = {
             "src_name":       src_buf,
             "dst_name":       dst_buf,
@@ -1444,6 +1565,88 @@ class TilelangVisitor:
                 template=last.template,
                 operator_representation=rep,
                 op_name=f"tile_collective_{op_str}_{group_id}",
+                spec=spec,
+            )
+            self._bindings.bindings[-1] = cb
+
+    def _handle_allreduce(self, args: list, cluster_id):
+        """T.allreduce(buf, reduce_op, axis, group) → in-place CollectiveBinding.
+
+        Argument layout emitted by tilelang.language.allreduce:
+          args[0] : buf_region (BufferRegion, access_type="rw"; src == dst)
+          args[1] : StringImm(reduce_op)   e.g. "sum", "max"
+          args[2] : StringImm(axis or "")  loop-variable hint (unused here)
+          args[3] : StringImm(group or "") group_id; falls back to _current_group_id
+
+        src_buffer and dst_buffer are both set to the same buffer name (in-place).
+        reduce_axis is resolved from the buffer's TensorLayout if annotated.
+        """
+        if len(args) < 1:
+            return
+
+        buf_name = (self._region_buf_name(args[0])
+                    if hasattr(args[0], "args") else str(args[0]))
+        reduce_op = str(args[1]).strip('"') if len(args) > 1 else "sum"
+        group_id_arg = str(args[3]).strip('"') if len(args) > 3 else ""
+        group_id = group_id_arg if group_id_arg else self._current_group_id
+
+        if group_id is None:
+            print("[TilelangVisitor] Warning: T.allreduce() outside a cluster_group block; skipping.")
+            return
+
+        # Compute nbytes from the buffer
+        tvm_buf = self._local_bufs.get(buf_name) or self._global_bufs.get(buf_name)
+        if tvm_buf is not None:
+            nbytes = _prod(tvm_buf.shape) * _dtype_bytes(str(tvm_buf.dtype))
+        else:
+            nbytes = 0
+
+        # Resolve reduce_axis from TensorLayout annotation if present
+        layout = self._buffer_layouts.get(buf_name)
+        reduce_axis = None
+        src_layout = None
+        if layout is not None:
+            src_layout = layout
+            if layout.is_partial:
+                reduce_axis = layout.reduce_axis()
+
+        spec = CollectiveOpSpec(
+            op="allreduce",
+            group_id=group_id,
+            src_buffer=buf_name,
+            dst_buffer=buf_name,
+            reduce_op=reduce_op,
+            reduce_axis=reduce_axis,
+            src_layout=src_layout,
+        )
+        shard_meta = self._make_shard_metadata()
+        # Fall back to the resolved group_id when _current_group_id was None
+        # (happens when the allreduce arg carries an explicit group name but the
+        # TIR places the Evaluate node outside the cluster_group AttrStmt body).
+        if shard_meta is None and group_id is not None:
+            shard_meta = ShardMetadata(group_id=group_id)
+        rep = {
+            "src_name":       buf_name,
+            "dst_name":       buf_name,
+            "op":             "allreduce",
+            "group_id":       group_id,
+            "nbytes":         nbytes,
+            "cluster_id":     None,
+            "shard_metadata": shard_meta,
+        }
+        self._emit_binding(
+            "group_collective",
+            NodeTemplate(f"// T.allreduce({buf_name}, {reduce_op}) — lowered by CollectiveLoweringPass\n"),
+            rep,
+            code_transformer=None,
+        )
+        if self._bindings is not None:
+            last = self._bindings.bindings[-1]
+            cb = CollectiveBinding(
+                op_kind="group_collective",
+                template=last.template,
+                operator_representation=rep,
+                op_name=f"tile_allreduce_{buf_name}_{group_id}",
                 spec=spec,
             )
             self._bindings.bindings[-1] = cb
