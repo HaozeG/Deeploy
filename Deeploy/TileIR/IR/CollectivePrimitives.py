@@ -10,9 +10,6 @@ communication.  No hardware-specific lowering lives here; that belongs in
 
 Classes
 -------
-ParallelismStrategy
-    Enumeration of parallelism strategies (DP, TP, SP, EP, PP).
-
 ClusterGroup
     A strict 2-D group of clusters matching SoftHier's
     ``grid_sync_group_init(group_x, group_y)`` primitive.  One call
@@ -34,18 +31,7 @@ ShardMetadata
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Dict, List, Optional, Tuple
-
-
-class ParallelismStrategy(Enum):
-    """High-level parallelism strategy label."""
-
-    DP = "data_parallel"
-    TP = "tensor_parallel"
-    SP = "sequence_parallel"
-    EP = "expert_parallel"
-    PP = "pipeline_parallel"
 
 
 @dataclass
@@ -74,8 +60,6 @@ class ClusterGroup:
         Used in ``TensorLayout.axis_map`` values.
     root_coord : (int, int)
         ``(rx, ry)`` root rank within one group instance, default ``(0, 0)``.
-    strategy : ParallelismStrategy or None
-        Metadata-only parallelism label.
     """
 
     group_id: str
@@ -84,7 +68,6 @@ class ClusterGroup:
     num_groups: int = 1
     axis_names: Tuple[str, str] = ("x", "y")
     root_coord: Tuple[int, int] = (0, 0)
-    strategy: Optional[ParallelismStrategy] = None
     physical_cluster_ids: Optional[List[int]] = None
 
     def __post_init__(self):
@@ -145,34 +128,9 @@ class ClusterGroup:
         return self.num_ranks_per_instance
 
     @property
-    def cluster_ids(self) -> List[int]:
-        """Rank indices within one instance (0..num_ranks_per_instance-1).
-
-        .. deprecated::
-            Use ``HardwareBinding.clusters_for(group_id)`` for physical IDs.
-        """
-        return list(range(self.num_ranks_per_instance))
-
-    @property
     def root_instance(self) -> int:
-        """Row-major rank of root within one instance (legacy compat)."""
+        """Row-major rank of root within one instance."""
         return self.rank_of(self.root_coord[0], self.root_coord[1])
-
-    @classmethod
-    def from_flat(
-        cls,
-        group_id: str,
-        cluster_ids: List[int],
-        strategy: Optional[ParallelismStrategy] = None,
-    ) -> "ClusterGroup":
-        """Construct a 1-D (row) group from a flat list of cluster IDs."""
-        return cls(
-            group_id=group_id,
-            group_x=len(cluster_ids),
-            group_y=1,
-            num_groups=1,
-            strategy=strategy,
-        )
 
 
 @dataclass
@@ -292,6 +250,15 @@ class CollectiveOpSpec:
     reduce_axis: Optional[str] = None
     src_layout: Optional[TensorLayout] = None
     dst_layout: Optional[TensorLayout] = None
+    # Extra parameters for directional / point-to-point ops:
+    #   ``shift_by``      — ring rotation step (ops: "shift")
+    #   ``from_coord``    — source rank along an axis (ops: "bcast_axis"), static int
+    #   ``from_coord_expr`` — C expression for source rank when dynamic (e.g. "gid_y")
+    #   ``global_barrier_before`` — emit flex_global_barrier_xy() before the collective
+    shift_by: int = 0
+    from_coord: int = 0
+    from_coord_expr: Optional[str] = None
+    global_barrier_before: bool = False
 
 
 @dataclass
@@ -299,7 +266,6 @@ class ShardMetadata:
     """Lightweight per-TileBinding metadata for tile-reuse analysis."""
 
     group_id: Optional[str] = None
-    parallelism_strategy: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -309,18 +275,14 @@ class ShardMetadata:
 def parse_cluster_group_spec(spec: str, registry: "ClusterGroupRegistry") -> str:
     """Parse a cluster_group AttrStmt value and register the group.
 
-    Handles two forms:
-    1. Bare name (legacy): ``"tp_row"`` — returns the group_id unchanged.
-    2. Full spec: ``"tp;x=2;y=1;num_groups=1;axes=tp,_;root=0,0"``
-       Parses, synthesizes a ``ClusterGroup``, registers it (if not already
-       registered), and returns the group_id.
+    Requires the full spec form ``"name;x=<X>;y=<Y>;num_groups=<N>;
+    axes=<a0>,<a1>;root=<rx>,<ry>"``.  ``x`` and ``y`` are mandatory —
+    for a 1-D group use ``y=1``.  ``num_groups``, ``axes``, ``root`` are
+    optional.
     """
     spec = spec.strip('"').strip("'").strip()
     parts = spec.split(";")
     group_id = parts[0]
-
-    if len(parts) == 1:
-        return group_id
 
     kv: Dict[str, str] = {}
     for part in parts[1:]:
@@ -328,8 +290,25 @@ def parse_cluster_group_spec(spec: str, registry: "ClusterGroupRegistry") -> str
             k, v = part.split("=", 1)
             kv[k.strip()] = v.strip()
 
-    group_x = int(kv.get("x", 1))
-    group_y = int(kv.get("y", 1))
+    # Bare-name form: group must already be in the registry (pre-registered
+    # by the test harness or a prior pass).  No kv params → nothing to update.
+    if not kv:
+        if registry.contains(group_id):
+            return group_id
+        raise ValueError(
+            f"parse_cluster_group_spec: bare spec {spec!r} refers to a group "
+            f"that is not pre-registered.  Use T.cluster_group(x=N, y=1, ...) "
+            f"to declare it inline."
+        )
+
+    if "x" not in kv or "y" not in kv:
+        raise ValueError(
+            f"parse_cluster_group_spec: spec {spec!r} missing required 'x' "
+            f"and/or 'y'.  Use T.cluster_group(x=N, y=1, ...) for 1-D groups."
+        )
+
+    group_x = int(kv["x"])
+    group_y = int(kv["y"])
     num_groups = int(kv.get("num_groups", 1))
 
     axes_raw = kv.get("axes", "x,y").split(",")
@@ -343,25 +322,19 @@ def parse_cluster_group_spec(spec: str, registry: "ClusterGroupRegistry") -> str
         rc = kv["root"].split(",")
         root_coord = (int(rc[0]), int(rc[1]) if len(rc) > 1 else 0)
 
-    strategy: Optional[ParallelismStrategy] = None
-    if "strategy" in kv:
-        stag = kv["strategy"]
-        for s in ParallelismStrategy:
-            if s.value == stag or s.name.lower() == stag.lower():
-                strategy = s
-                break
-
-    if not registry.contains(group_id):
-        group = ClusterGroup(
-            group_id=group_id,
-            group_x=group_x,
-            group_y=group_y,
-            num_groups=num_groups,
-            axis_names=axis_names,
-            root_coord=root_coord,
-            strategy=strategy,
-        )
-        registry.register(group)
+    # Always register/update from the DSL spec so group shape (x, y, axis_names)
+    # reflects the kernel annotation.  The actual num_active_instances used for
+    # cluster_active is derived from HardwareBinding.active_instances() at
+    # CollectiveLoweringPass time, so keeping num_groups here as a fallback is safe.
+    group = ClusterGroup(
+        group_id=group_id,
+        group_x=group_x,
+        group_y=group_y,
+        num_groups=num_groups,
+        axis_names=axis_names,
+        root_coord=root_coord,
+    )
+    registry.register(group)
 
     return group_id
 

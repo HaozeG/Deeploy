@@ -45,7 +45,7 @@ from Deeploy.TileIR.Frontend.TilelangVisitor import TilelangVisitor
 from Deeploy.TileIR.IR.CollectivePrimitives import ClusterGroupRegistry
 from Deeploy.TileIR.IR.HardwareBinding import CollectiveBackend, HardwareBinding, SoftHierCollectiveBackend
 from Deeploy.TileIR.IR.ParallelPasses import CollectiveLoweringPass, GroupAwareBarrierPass
-from Deeploy.TileIR.Midend.TileBindings import SoftwarePipelinePass
+from Deeploy.TileIR.Midend.TileBindings import DedupSyncPass, HoistAllocFreePass, SoftwarePipelinePass
 from Deeploy.Targets.SoftHier.Platform import SoftHierDynamicBuffer
 from testUtils.codeGenerate import generateTilelangSoftHierTestNetwork
 
@@ -167,12 +167,15 @@ def compile_tilelang_to_softhier_parallel(
         num_clusters=num_clusters,
         cluster_ids=cluster_ids,
         group_registry=group_registry,
+        hw_binding=hw_binding,
     )
     tilebinding = visitor.visit_bindings(primfunc, ctxt)
 
     # Replace default GlobalClusterBarrierPass with group-aware pass;
     # keep SoftwarePipelinePass first to handle T.Pipelined(num_stages=N) loops.
-    tilebinding.binding_passes = [SoftwarePipelinePass(), GroupAwareBarrierPass()]
+    # Pass group_registry so SoftwarePipelinePass can emit strided K-split loops
+    # for multi-cluster TP groups instead of running all K-blocks on every cluster.
+    tilebinding.binding_passes = [SoftwarePipelinePass(group_registry=group_registry), HoistAllocFreePass(), GroupAwareBarrierPass()]
     # Add collective lowering pass
     tilebinding.add_binding_pass(
         CollectiveLoweringPass(
@@ -180,6 +183,8 @@ def compile_tilelang_to_softhier_parallel(
             hw_binding=hw_binding,
             backend=backend,
         ))
+    # Final cleanup: collapse runs of consecutive intra-cluster syncs.
+    tilebinding.add_binding_pass(DedupSyncPass())
 
     ctxt, eb = tilebinding.codeTransform(ctxt)
     return eb.generate(ctxt)

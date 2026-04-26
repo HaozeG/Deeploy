@@ -247,17 +247,20 @@ class CollectiveLoweringPass(TileBindingPass):
                     op_name="tile_global_barrier_after_group_init",
                 ))
             # Emit TileGroupContextTemplate after the post-init barrier.
-            # num_groups is passed so cluster_active_* uses this_grid_id < num_groups
-            # (SummaGEMM pattern) to restrict execution to active group instances.
+            # num_groups is derived from hw_binding (authoritative) so that
+            # cluster_active_* = valid_grid && (this_grid_id < actual_instances).
             for gid in ordered_groups:
                 group = self.registry.get(gid)
+                num_active = self.hw_binding.active_instances(gid, self.registry)
+                hw_bitmask = self.hw_binding.compute_hw_bitmask(gid)
                 prefix.append(
                     TileBinding(
                         op_kind="group_barrier",
                         template=TileGroupContextTemplate,
                         operator_representation={
                             "group_id":   gid,
-                            "num_groups": group.num_groups,
+                            "num_groups": num_active,
+                            "hw_bitmask": hw_bitmask,
                             "cluster_id": None,
                         },
                         op_name=f"tile_group_context_{gid}",
@@ -275,9 +278,24 @@ class CollectiveLoweringPass(TileBindingPass):
                 transformed.append(binding)
 
             elif isinstance(binding, CollectiveBinding) and binding.spec is not None:
+                # Honor buffer-name remapping done by SoftwarePipelinePass:
+                # operator_representation["src_name"] / ["dst_name"] may have been
+                # renamed to the double-buffered _cur variant; propagate that into
+                # the spec so strategies emit the correct C variable name.
+                spec = binding.spec
+                src_override = binding.operator_representation.get("src_name")
+                dst_override = binding.operator_representation.get("dst_name")
+                if (src_override is not None and src_override != spec.src_buffer) or \
+                        (dst_override is not None and dst_override != spec.dst_buffer):
+                    import dataclasses as _dc
+                    spec = _dc.replace(
+                        spec,
+                        src_buffer=src_override if src_override else spec.src_buffer,
+                        dst_buffer=dst_override if dst_override else spec.dst_buffer,
+                    )
                 # Lower to hardware bindings
                 hw_bindings = self.backend.lower(
-                    binding.spec,
+                    spec,
                     self.hw_binding,  # still passed for strategy compat
                     self.registry,
                 )

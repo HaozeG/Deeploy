@@ -56,6 +56,7 @@ TileGroupInitTemplate = NodeTemplate(TileGroupInitTemplateStr)
 
 TileGroupContextTemplateStr = r"""<%
 _num_groups = context.get('num_groups', 1)
+_hw_mask    = context.get('hw_bitmask', None)
 %>
 // GroupContext: per-cluster rank variables for group '${group_id}'
 // Pattern copied from SummaGEMM.h::SummaGEMMAnaylze lines 131-140 and FlatAttentionUtil.h lines 206-213.
@@ -64,45 +65,55 @@ uint32_t cluster_in_group_id_x_${group_id} = (group_info_${group_id}.valid_grid)
 uint32_t cluster_in_group_id_y_${group_id} = (group_info_${group_id}.valid_grid) ? (_pos_${group_id}.y % group_info_${group_id}.grid_y_dim) : 0;
 uint32_t cluster_for_rowwise_${group_id} = (group_info_${group_id}.valid_grid) && ((cluster_in_group_id_x_${group_id} % group_info_${group_id}.grid_y_dim) == (cluster_in_group_id_y_${group_id} % group_info_${group_id}.grid_x_dim)) && (cluster_in_group_id_x_${group_id} == (_pos_${group_id}.y % group_info_${group_id}.grid_x_dim));
 uint32_t cluster_for_colwise_${group_id} = (group_info_${group_id}.valid_grid) && ((cluster_in_group_id_x_${group_id} % group_info_${group_id}.grid_y_dim) == (cluster_in_group_id_y_${group_id} % group_info_${group_id}.grid_x_dim)) && (cluster_in_group_id_y_${group_id} == (_pos_${group_id}.x % group_info_${group_id}.grid_y_dim));
+## cluster_active: prefer compile-time hw_bitmask (same idiom as DP bitmask dispatch)
+## when hw_bitmask is None fall back to topology-driven this_grid_id < N guard.
+% if _hw_mask is not None:
+uint32_t cluster_active_${group_id} = group_info_${group_id}.valid_grid && ((1U << flex_get_cluster_id()) & ${_hw_mask}U);
+% else:
 uint32_t cluster_active_${group_id} = group_info_${group_id}.valid_grid && (group_info_${group_id}.this_grid_id < ${_num_groups});
-//    flex_global_barrier_xy();//Global barrier
-//    GridSyncGroupInfo info = group_info_${group_id};
-//    for (int cid = 0; cid < ARCH_NUM_CLUSTER; ++cid)
-//    {
-//        if (flex_get_core_id() == 0 && flex_get_cluster_id() == cid)
-//        {
-//            printf("[Cluster %3d] All Info: \n", cid);
-//            printf("-- valid_grid = %0d \n", info.valid_grid);
-//            printf("-- grid_x_dim = %0d \n", info.grid_x_dim);
-//            printf("-- grid_y_dim = %0d \n", info.grid_y_dim);
-//            printf("-- grid_x_num = %0d \n", info.grid_x_num);
-//            printf("-- grid_y_num = %0d \n", info.grid_y_num);
-//            printf("-- this_grid_id = %0d \n", info.this_grid_id);
-//            printf("-- this_grid_id_x = %0d \n", info.this_grid_id_x);
-//            printf("-- this_grid_id_y = %0d \n", info.this_grid_id_y);
-//            printf("-- this_grid_left_most = %0d \n", info.this_grid_left_most);
-//            printf("-- this_grid_right_most = %0d \n", info.this_grid_right_most);
-//            printf("-- this_grid_top_most = %0d \n", info.this_grid_top_most);
-//            printf("-- this_grid_bottom_most = %0d \n", info.this_grid_bottom_most);
-//            printf("-- this_grid_cluster_num = %0d \n", info.this_grid_cluster_num);
-//            printf("-- this_grid_cluster_num_x = %0d \n", info.this_grid_cluster_num_x);
-//            printf("-- this_grid_cluster_num_y = %0d \n", info.this_grid_cluster_num_y);
-//            printf("-- wakeup_row_mask = 0x%0x \n", info.wakeup_row_mask);
-//            printf("-- wakeup_col_mask = 0x%0x \n", info.wakeup_col_mask);
-//            printf("-- sync_x_cluster = %0d \n", info.sync_x_cluster);
-//            printf("-- sync_y_cluster = %0d \n", info.sync_y_cluster);
-//            printf("-- sync_x_point = 0x%0x \n", (uint32_t)info.sync_x_point);
-//            printf("-- sync_x_piter = 0x%0x \n", (uint32_t)info.sync_x_piter);
-//            printf("-- sync_y_point = 0x%0x \n", (uint32_t)info.sync_y_point);
-//            printf("-- sync_y_piter = 0x%0x \n", (uint32_t)info.sync_y_piter);
-//            printf("-- cluster_in_group_id_x = %0d \n", cluster_in_group_id_x_${group_id});
-//            printf("-- cluster_in_group_id_y = %0d \n", cluster_in_group_id_y_${group_id});
-//            printf("-- cluster_for_rowwise = %0d \n", cluster_for_rowwise_${group_id});
-//            printf("-- cluster_for_colwise = %0d \n", cluster_for_colwise_${group_id});
-//        }
-//        flex_global_barrier_xy();//Global barrier
-//    }
-//    flex_global_barrier_xy();//Global barrier
+% endif
+// Aliases for TIR vars emitted by T.cluster_group() as-clause
+uint32_t _group_id_${group_id}   = group_info_${group_id}.this_grid_id;
+uint32_t _group_id_x_${group_id} = cluster_in_group_id_x_${group_id};
+uint32_t _group_id_y_${group_id} = cluster_in_group_id_y_${group_id};
+    flex_global_barrier_xy();//Global barrier
+    GridSyncGroupInfo info = group_info_${group_id};
+    for (int cid = 0; cid < ARCH_NUM_CLUSTER; ++cid)
+    {
+        if (flex_get_core_id() == 0 && flex_get_cluster_id() == cid)
+        {
+            printf("[Cluster %3d] All Info: \n", cid);
+            printf("-- valid_grid = %0d \n", info.valid_grid);
+            printf("-- grid_x_dim = %0d \n", info.grid_x_dim);
+            printf("-- grid_y_dim = %0d \n", info.grid_y_dim);
+            printf("-- grid_x_num = %0d \n", info.grid_x_num);
+            printf("-- grid_y_num = %0d \n", info.grid_y_num);
+            printf("-- this_grid_id = %0d \n", info.this_grid_id);
+            printf("-- this_grid_id_x = %0d \n", info.this_grid_id_x);
+            printf("-- this_grid_id_y = %0d \n", info.this_grid_id_y);
+            printf("-- this_grid_left_most = %0d \n", info.this_grid_left_most);
+            printf("-- this_grid_right_most = %0d \n", info.this_grid_right_most);
+            printf("-- this_grid_top_most = %0d \n", info.this_grid_top_most);
+            printf("-- this_grid_bottom_most = %0d \n", info.this_grid_bottom_most);
+            printf("-- this_grid_cluster_num = %0d \n", info.this_grid_cluster_num);
+            printf("-- this_grid_cluster_num_x = %0d \n", info.this_grid_cluster_num_x);
+            printf("-- this_grid_cluster_num_y = %0d \n", info.this_grid_cluster_num_y);
+            printf("-- wakeup_row_mask = 0x%0x \n", info.wakeup_row_mask);
+            printf("-- wakeup_col_mask = 0x%0x \n", info.wakeup_col_mask);
+            printf("-- sync_x_cluster = %0d \n", info.sync_x_cluster);
+            printf("-- sync_y_cluster = %0d \n", info.sync_y_cluster);
+            printf("-- sync_x_point = 0x%0x \n", (uint32_t)info.sync_x_point);
+            printf("-- sync_x_piter = 0x%0x \n", (uint32_t)info.sync_x_piter);
+            printf("-- sync_y_point = 0x%0x \n", (uint32_t)info.sync_y_point);
+            printf("-- sync_y_piter = 0x%0x \n", (uint32_t)info.sync_y_piter);
+            printf("-- cluster_in_group_id_x = %0d \n", cluster_in_group_id_x_${group_id});
+            printf("-- cluster_in_group_id_y = %0d \n", cluster_in_group_id_y_${group_id});
+            printf("-- cluster_for_rowwise = %0d \n", cluster_for_rowwise_${group_id});
+            printf("-- cluster_for_colwise = %0d \n", cluster_for_colwise_${group_id});
+        }
+        flex_global_barrier_xy();//Global barrier
+    }
+    flex_global_barrier_xy();//Global barrier
 """
 
 TileGroupContextTemplate = NodeTemplate(TileGroupContextTemplateStr)
@@ -157,9 +168,16 @@ TileAllocReducerTemplate = NodeTemplate(TileAllocReducerTemplateStr)
 #   cluster_id          : None
 # ---------------------------------------------------------------------------
 
-TileCollectiveReduceTemplateStr = r"""
+TileCollectiveReduceTemplateStr = r"""<%
+_global_barrier = context.get('global_barrier', False)
+%>
+% if _global_barrier:
+// Cross-group sync before reduction (split-K pattern: all clusters participate)
+flex_global_barrier_xy();
+% else:
 // All '${group_id}' members sync before reduction starts
 grid_sync_group_barrier_xy(&group_info_${group_id});
+% endif
 // CollectiveReduce: ${collective_op_kind} over group '${group_id}'
 // Edge cluster (${edge_flag}) accumulates ${src_name} -> ${dst_name}
 if (flex_is_dm_core() && ${edge_flag}) {
@@ -173,8 +191,12 @@ if (flex_is_dm_core() && ${edge_flag}) {
     );
     flex_dma_async_wait_all();
 }
+% if _global_barrier:
+flex_global_barrier_xy();
+% else:
 // All group members sync (non-edge waits for edge to finish)
 grid_sync_group_barrier_xy(&group_info_${group_id});
+% endif
 """
 
 TileCollectiveReduceTemplate = NodeTemplate(TileCollectiveReduceTemplateStr)
@@ -193,7 +215,15 @@ TileCollectiveReduceTemplate = NodeTemplate(TileCollectiveReduceTemplateStr)
 #   cluster_id          : None
 # ---------------------------------------------------------------------------
 
-TileCollectiveBroadcastTemplateStr = r"""
+TileCollectiveBroadcastTemplateStr = r"""<%
+_global_barrier = context.get('global_barrier', False)
+%>
+% if _global_barrier:
+flex_global_barrier_xy();
+% else:
+// All group members sync (non-edge waits for edge to finish broadcast)
+grid_sync_group_barrier_xy(&group_info_${group_id});
+% endif
 // CollectiveBroadcast: edge cluster (${edge_flag}) -> all '${group_id}' members
 if (flex_is_dm_core() && ${edge_flag}) {
     flex_dma_async_broadcast(
@@ -205,8 +235,12 @@ if (flex_is_dm_core() && ${edge_flag}) {
     );
     flex_dma_async_wait_all();
 }
+% if _global_barrier:
+flex_global_barrier_xy();
+% else:
 // All group members sync (non-edge waits for edge to finish broadcast)
 grid_sync_group_barrier_xy(&group_info_${group_id});
+% endif
 """
 
 TileCollectiveBroadcastTemplate = NodeTemplate(TileCollectiveBroadcastTemplateStr)
@@ -275,3 +309,45 @@ grid_sync_group_barrier_xy(&group_info_${group_id});
 """
 
 TileCollectiveGatherTemplate = NodeTemplate(TileCollectiveGatherTemplateStr)
+
+
+# ---------------------------------------------------------------------------
+# GroupShift — Cannon / Systolic ring rotation along a single group axis.
+# v1: wrap-only semantics.  Emits a stub comment today; replace the body
+# with a real SoftHier ring-DMA primitive (``flex_dma_async_shift``
+# or equivalent) once it lands in the runtime.
+# ---------------------------------------------------------------------------
+
+TileCollectiveGroupShiftTemplateStr = r"""
+// GroupShift: rotate ${src_name} along group '${group_id}' axis='${axis_name}' by ${shift_by}
+// TODO(softhier-runtime): replace with flex_dma_async_shift once available.
+// Cluster-local no-op placeholder so the dispatch pipeline stays correct.
+(void)${src_name};
+grid_sync_group_barrier_xy(&group_info_${group_id});
+"""
+
+TileCollectiveGroupShiftTemplate = NodeTemplate(TileCollectiveGroupShiftTemplateStr)
+
+
+# ---------------------------------------------------------------------------
+# GroupBcastAxis — axis-scoped broadcast originating from a chosen source
+# rank (not necessarily the group root).  Used by SUMMA's A-broadcast phase.
+# ---------------------------------------------------------------------------
+
+TileCollectiveGroupBcastAxisTemplateStr = r"""
+grid_sync_group_barrier_xy(&group_info_${group_id});
+// GroupBcastAxis: broadcast ${src_name} along group '${group_id}' axis='${axis_name}' from rank ${from_coord}
+if (flex_is_dm_core() && ${edge_flag}) {
+    flex_dma_async_broadcast(
+        (uint64_t)${dst_name},
+        (uint64_t)${src_name},
+        ${nbytes},
+        ${row_mask},
+        ${col_mask}
+    );
+    flex_dma_async_wait_all();
+}
+grid_sync_group_barrier_xy(&group_info_${group_id});
+"""
+
+TileCollectiveGroupBcastAxisTemplate = NodeTemplate(TileCollectiveGroupBcastAxisTemplateStr)

@@ -78,25 +78,47 @@ def _row_col_masks(
 ) -> tuple:
     """Return (row_mask_expr, col_mask_expr, edge_flag_expr) C strings.
 
-    For an axis-scoped collective:
-      - row-axis reduce: row_mask = wakeup_row_mask, col = wakeup_col_mask
-      - col-axis reduce: col_mask = wakeup_col_mask, row = wakeup_row_mask
-      - edge cluster identified by cluster_for_rowwise / cluster_for_colwise
+    Mirrors the reference MLA_decode_MHA.h idiom exactly:
 
-    For a full-group collective (reduce_axis is None):
-      - use wakeup_row_mask and wakeup_col_mask, edge = cluster_for_rowwise.
+      axis = axis_names[0] (x) — row-wise (broadcast/reduce across a row):
+        row_mask = wakeup_row_mask,  col_mask = (ARCH_NUM_CLUSTER_Y - 1)
+        edge    = (cluster_in_group_id_x_<gid> == 0)   [west-edge cluster]
+
+      axis = axis_names[1] (y) — col-wise (broadcast/reduce along a column):
+        row_mask = (ARCH_NUM_CLUSTER_X - 1), col_mask = wakeup_col_mask
+        edge    = (cluster_in_group_id_y_<gid> == 0)   [south-edge cluster]
+
+      reduce_axis is None — full-group 2-D tree (fallback):
+        row_mask = wakeup_row_mask, col_mask = wakeup_col_mask
+        edge    = cluster_for_rowwise_<gid>             [diagonal cluster]
+
+    Inter-group / split-K (cross-instance) is NOT handled here; callers
+    override masks via spec.global_barrier_before (AxisReduceBroadcast).
     """
-    if reduce_axis is not None and reduce_axis == group.axis_names[1]:
-        # Reduce along the y (column) axis
-        row_mask = f"group_info_{gid}.wakeup_row_mask"
-        col_mask = f"group_info_{gid}.wakeup_col_mask"
-        edge_flag = f"cluster_for_colwise_{gid}"
-    else:
-        # Default: reduce along x (row) axis or full-group
-        row_mask = f"group_info_{gid}.wakeup_row_mask"
-        col_mask = f"group_info_{gid}.wakeup_col_mask"
-        edge_flag = f"cluster_for_rowwise_{gid}"
-    return row_mask, col_mask, edge_flag
+    x_axis, y_axis = group.axis_names
+
+    if reduce_axis == x_axis:
+        # Row-wise: reduce/broadcast across a row (along x within each row).
+        return (
+            f"group_info_{gid}.wakeup_row_mask",
+            "(ARCH_NUM_CLUSTER_Y - 1)",
+            f"(cluster_in_group_id_x_{gid} == 0)",
+        )
+
+    if reduce_axis == y_axis:
+        # Col-wise: reduce/broadcast along a column (along y within each col).
+        return (
+            "(ARCH_NUM_CLUSTER_X - 1)",
+            f"group_info_{gid}.wakeup_col_mask",
+            f"(cluster_in_group_id_y_{gid} == 0)",
+        )
+
+    # Full-group: 2-D reduction tree (no axis annotation).
+    return (
+        f"group_info_{gid}.wakeup_row_mask",
+        f"group_info_{gid}.wakeup_col_mask",
+        f"cluster_for_rowwise_{gid}",
+    )
 
 
 def _collective_op_kind(reduce_op: str) -> str:
@@ -158,8 +180,18 @@ class AxisReduceBroadcast(CollectiveStrategy):
 
         row_mask, col_mask, edge_flag = _row_col_masks(gid, reduce_axis, group)
         op_kind = _collective_op_kind(spec.reduce_op)
-
         nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
+
+        # Split-K cross-instance reduction: use inverted masks so the DMA reduction
+        # tree spans corresponding ranks across all group instances, and use a global
+        # barrier (flex_global_barrier_xy) instead of the per-group barrier.
+        # Matches SummaGEMM.h:396-397,480-481 (~wakeup_row_mask / ~wakeup_col_mask).
+        global_barrier = spec.global_barrier_before
+        if global_barrier:
+            row_mask = f"(~group_info_{gid}.wakeup_row_mask)"
+            col_mask = f"(~group_info_{gid}.wakeup_col_mask)"
+            # All clusters in every instance participate; edge_flag = rowwise (same formula)
+            edge_flag = f"cluster_for_rowwise_{gid}"
 
         reduce_rep = {
             "src_name":           spec.src_buffer,
@@ -170,6 +202,7 @@ class AxisReduceBroadcast(CollectiveStrategy):
             "row_mask":           row_mask,
             "col_mask":           col_mask,
             "edge_flag":          edge_flag,
+            "global_barrier":     global_barrier,
             "nbytes":             nbytes_placeholder,
             "cluster_id":         None,
             "shard_metadata":     None,
@@ -182,6 +215,7 @@ class AxisReduceBroadcast(CollectiveStrategy):
             "row_mask":        row_mask,
             "col_mask":        col_mask,
             "edge_flag":       edge_flag,
+            "global_barrier":  global_barrier,
             "nbytes":          nbytes_placeholder,
             "cluster_id":      None,
             "shard_metadata":  None,
@@ -415,6 +449,114 @@ class GatherStrategy(CollectiveStrategy):
 
 
 # ---------------------------------------------------------------------------
+# Strategy 6: GroupShift  — Cannon / Systolic ring-rotation along one axis.
+# ---------------------------------------------------------------------------
+
+class GroupShift(CollectiveStrategy):
+    """Ring-shift a tile by ``spec.shift_by`` along ``spec.reduce_axis``.
+
+    v1 semantics: wrap-around only.  The SoftHier runtime primitive for
+    ring DMA is wired in via ``TileCollectiveGroupShiftTemplate`` (a thin
+    wrapper around ``flex_dma_async_shift`` when available, else a C
+    comment stub for validation of the dispatch plumbing).
+    """
+
+    def matches(self, spec, group, topology):
+        return spec.op == "shift"
+
+    def emit(self, spec, binding, registry) -> List["TileBinding"]:
+        from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
+            TileCollectiveGroupShiftTemplate,
+        )
+        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+
+        gid = spec.group_id
+        group = registry.get(gid)
+        axis_idx = group.axis_index(spec.reduce_axis) if spec.reduce_axis else 0
+        nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
+
+        rep = {
+            "src_name":       spec.src_buffer,
+            "dst_name":       spec.dst_buffer,
+            "group_id":       gid,
+            "axis_index":     axis_idx,
+            "axis_name":      spec.reduce_axis or group.axis_names[0],
+            "shift_by":       spec.shift_by,
+            "nbytes":         nbytes_placeholder,
+            "cluster_id":     None,
+            "shard_metadata": None,
+        }
+        return [
+            TileBinding(
+                op_kind="group_collective",
+                template=TileCollectiveGroupShiftTemplate,
+                operator_representation=rep,
+                op_name=f"tile_collective_group_shift_{gid}",
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Strategy 7: GroupBcastAxis — axis-scoped broadcast from a named source rank.
+# ---------------------------------------------------------------------------
+
+class GroupBcastAxis(CollectiveStrategy):
+    """Axis-scoped broadcast originating from ``spec.from_coord``.
+
+    Differs from :class:`AxisBroadcast` in that the source rank is
+    user-specified (not the group root) — this is SUMMA's A-broadcast
+    phase, where every column originates from a different rank.
+    """
+
+    def matches(self, spec, group, topology):
+        return spec.op == "bcast_axis"
+
+    def emit(self, spec, binding, registry) -> List["TileBinding"]:
+        from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
+            TileCollectiveGroupBcastAxisTemplate,
+        )
+        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+
+        gid = spec.group_id
+        group = registry.get(gid)
+        axis_idx = group.axis_index(spec.reduce_axis) if spec.reduce_axis else 0
+        row_mask, col_mask, edge_flag = _row_col_masks(gid, spec.reduce_axis, group)
+        nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
+
+        # Dynamic from_coord: derive per-cluster edge_flag from the C expression
+        # rather than the static group root (e.g. "gid_y" → diagonal cluster).
+        if spec.from_coord_expr is not None:
+            along = spec.reduce_axis or group.axis_names[0]
+            if along == group.axis_names[0]:
+                edge_flag = f"(cluster_in_group_id_x_{gid} == ({spec.from_coord_expr}))"
+            else:
+                edge_flag = f"(cluster_in_group_id_y_{gid} == ({spec.from_coord_expr}))"
+
+        rep = {
+            "src_name":       spec.src_buffer,
+            "dst_name":       spec.dst_buffer,
+            "group_id":       gid,
+            "axis_index":     axis_idx,
+            "axis_name":      spec.reduce_axis or group.axis_names[0],
+            "from_coord":     spec.from_coord_expr if spec.from_coord_expr is not None else spec.from_coord,
+            "row_mask":       row_mask,
+            "col_mask":       col_mask,
+            "edge_flag":      edge_flag,
+            "nbytes":         nbytes_placeholder,
+            "cluster_id":     None,
+            "shard_metadata": None,
+        }
+        return [
+            TileBinding(
+                op_kind="group_collective",
+                template=TileCollectiveGroupBcastAxisTemplate,
+                operator_representation=rep,
+                op_name=f"tile_collective_group_bcast_axis_{gid}",
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Priority list — first match wins
 # ---------------------------------------------------------------------------
 
@@ -424,4 +566,6 @@ STRATEGIES: List[Type[CollectiveStrategy]] = [
     FullGroupReduceBroadcast, # allreduce without axis annotation (legacy fallback)
     ScatterStrategy,          # scatter
     GatherStrategy,           # gather
+    GroupShift,               # ring-shift along a group axis (Cannon / Systolic)
+    GroupBcastAxis,           # axis-scoped broadcast from a chosen rank (SUMMA A-phase)
 ]

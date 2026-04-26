@@ -61,18 +61,39 @@ TileBlockPreambleTemplate = NodeTemplate(TileBlockPreambleTemplateStr)
 # TileGroupPreamble — cluster_active guard for multi-cluster groups (TP-style).
 #
 # Uses cluster_active_${group_id} declared in TileGroupContextTemplate:
-#   cluster_active = valid_grid && (this_grid_id < num_groups)
+#   cluster_active = valid_grid && (this_grid_id < num_active_instances)
 # This mirrors SummaGEMM's "this_grid_id < summa_groups" check and correctly
-# restricts execution to the intended num_groups group instances while letting
-# unused instances skip the tile body (and the group barriers inside it).
+# restricts execution to the intended group instances while letting unused
+# instances skip the tile body (and the group barriers inside it).
+#
+# When num_active_instances > 1 and block_id_expr is set, a per-tile dispatch
+# check is appended so each group instance handles a disjoint tile subset:
+#   this_grid_id == (tile_block_id % num_active_instances)
 #
 # OperatorRepresentation keys:
-#   group_id  : str
+#   group_id             : str
+#   block_id_expr        : str or None  — C expression for the flat tile index
+#   num_active_instances : int or None  — total active group instances
 # ---------------------------------------------------------------------------
 
-TileGroupPreambleTemplateStr = r"""
+TileGroupPreambleTemplateStr = r"""<%
+_bie  = context.get('block_id_expr', None)
+_n    = context.get('num_active_instances', None)
+_tbl  = context.get('tgid_table', None)
+_dispatch = _bie is not None and _n is not None and _n > 1
+%>
 // group-preamble: skip tile if not in an active group instance ('${group_id}')
+% if _dispatch and _tbl is not None:
+<%
+_tbl_str = ", ".join(str(t) for t in _tbl)
+%>
+static const uint32_t _tgid_table_${group_id}[${_n}] = {${_tbl_str}};
+if (!cluster_active_${group_id} || (group_info_${group_id}.this_grid_id != _tgid_table_${group_id}[(${_bie}) % ${_n}]))
+% elif _dispatch:
+if (!cluster_active_${group_id} || (group_info_${group_id}.this_grid_id != ((${_bie}) % ${_n})))
+% else:
 if (!cluster_active_${group_id})
+% endif
   continue;
 """
 
@@ -276,6 +297,23 @@ ForLoopCloseTemplateStr = r"""
 ForLoopOpenTemplate        = NodeTemplate(ForLoopOpenTemplateStr)
 ForLoopOpenStridedTemplate = NodeTemplate(ForLoopOpenStridedTemplateStr)
 ForLoopCloseTemplate       = NodeTemplate(ForLoopCloseTemplateStr)
+
+# ---------------------------------------------------------------------------
+# If / Else — C conditional block wrappers.
+#
+# Emitted by TilelangVisitor._visit_IfThenElse when TIR contains an
+# IfThenElse node (e.g. from ``if group_id_x == 0:`` in a @tilelang.jit
+# kernel).  ``condition`` is a C expression string produced by
+# _ExprStringifier with group-variable substitutions applied.
+#
+# OperatorRepresentation keys:
+#   condition  : str             — C boolean expression
+#   cluster_id : None            — no cluster guard on structural braces
+# ---------------------------------------------------------------------------
+
+IfOpenTemplate  = NodeTemplate("if (${condition}) {\n")
+IfCloseTemplate = NodeTemplate("}\n")
+ElseOpenTemplate = NodeTemplate("} else {\n")
 
 # ---------------------------------------------------------------------------
 # TileSync — software barrier between DM-core-driven DMA and compute cores.

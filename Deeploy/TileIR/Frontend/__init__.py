@@ -13,7 +13,6 @@ from Deeploy.TileIR.IR import (
     CollectiveLoweringPass,
     GroupAwareBarrierPass,
     HardwareBinding,
-    ParallelismStrategy,
     ShardMetadata,
     SoftHierCollectiveBackend,
 )
@@ -27,7 +26,6 @@ __all__ = [
     "CollectiveLoweringPass",
     "GroupAwareBarrierPass",
     "HardwareBinding",
-    "ParallelismStrategy",
     "ShardMetadata",
     "SoftHierCollectiveBackend",
 ]

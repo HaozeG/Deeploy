@@ -8,7 +8,6 @@ from Deeploy.TileIR.IR.CollectivePrimitives import (
     ClusterGroup,
     ClusterGroupRegistry,
     CollectiveOpSpec,
-    ParallelismStrategy,
     ShardMetadata,
     TensorLayout,
 )
@@ -16,6 +15,7 @@ from Deeploy.TileIR.IR.HardwareBinding import (
     CollectiveBackend,
     HardwareBinding,
     HwTopology,
+    Placement,
     SoftHierCollectiveBackend,
 )
 from Deeploy.TileIR.IR.ParallelPasses import (
@@ -28,11 +28,11 @@ __all__ = [
     "ClusterGroup",
     "ClusterGroupRegistry",
     "CollectiveOpSpec",
-    "ParallelismStrategy",
     "ShardMetadata",
     "TensorLayout",
     "HardwareBinding",
     "HwTopology",
+    "Placement",
     "CollectiveBackend",
     "SoftHierCollectiveBackend",
     "CollectiveBinding",

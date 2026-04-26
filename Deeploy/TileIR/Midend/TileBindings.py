@@ -74,6 +74,9 @@ TileOpKind = Literal[
     "sync",
     "comment",
     "block_preamble",
+    "if_open",
+    "if_close",
+    "else_open",
 ]
 
 
@@ -81,6 +84,9 @@ _BARRIER_TRANSPARENT_OP_KINDS = {
     "for_open",
     "for_close",
     "comment",
+    "if_open",
+    "if_close",
+    "else_open",
 }
 
 
@@ -247,15 +253,21 @@ class SoftwarePipelinePass(TileBindingPass):
         for info in scope_info.values():
             all_dup_names.update(info["load_buf_names"])
 
-        # Pre-scan: collect group_ids that have collective ops (group_collective bindings).
-        # K-split strided loops are only applied to groups with actual collectives (TP),
-        # not DP groups that happen to have group_x > 1.
+        # Pre-scan: collect group_ids that have *allreduce* collective ops.
+        # K-split strided loops are only applied to TP allreduce groups, NOT to
+        # directional collectives (bcast_axis, shift) used in SUMMA / Cannon kernels.
         collective_group_ids: Set[str] = set()
         for b in bindings:
             if b.op_kind == "group_collective":
                 gid = b.operator_representation.get("group_id")
-                if gid:
-                    collective_group_ids.add(gid)
+                if not gid:
+                    continue
+                from Deeploy.TileIR.IR.ParallelPasses import CollectiveBinding as _CB
+                if isinstance(b, _CB) and b.spec is not None:
+                    if b.spec.op == "allreduce":
+                        collective_group_ids.add(gid)
+                else:
+                    collective_group_ids.add(gid)  # legacy non-CollectiveBinding path
 
         # ---------------------------------------------------------------
         # Main rewrite pass
@@ -347,24 +359,37 @@ class SoftwarePipelinePass(TileBindingPass):
         """
         if self.group_registry is None:
             return None, 1
-        # Strategy 1: shard_metadata on inner bindings (most specific)
+        # Only allreduce groups should trigger K-split.  Build the effective
+        # set once so both strategies share the same restriction.
+        _allreduce_groups = collective_group_ids or set()
+
+        # Strategy 1: shard_metadata on inner bindings (most specific).
+        # The GEMM and other compute bindings inside T.cluster_group carry
+        # shard_metadata.group_id, so we see the group here even without an
+        # explicit allreduce AttrStmt wrapping the loop.  Guard with
+        # _allreduce_groups to prevent SUMMA / Cannon (bcast_axis / shift)
+        # groups from being mistaken for TP K-split groups.
+        # TP K-split requires group_y == 1 (1-D group along X). 2-D groups
+        # (SUMMA) partition K by instance (gid), not by cluster_in_group_id_x.
         for b in inner_bindings:
             sm = b.operator_representation.get("shard_metadata")
             if sm is None or not hasattr(sm, "group_id") or not sm.group_id:
                 continue
+            if sm.group_id not in _allreduce_groups:
+                continue
             try:
                 group = self.group_registry.get(sm.group_id)
-                if group.group_x > 1:
+                if group.group_x > 1 and int(group.group_y) == 1:
                     return sm.group_id, int(group.group_x)
             except (KeyError, AttributeError):
                 pass
-        # Strategy 2: registry fallback — groups with collectives AND group_x > 1.
-        # Only match when collective_group_ids is non-empty (i.e. we have real
-        # collective info); an empty set means no collectives → no K-split.
-        if collective_group_ids:
-            for group in self.group_registry.groups:
-                if int(group.group_x) > 1 and group.group_id in collective_group_ids:
-                    return group.group_id, int(group.group_x)
+        # Strategy 2: registry fallback — groups with allreduce AND group_x > 1.
+        # Only match when _allreduce_groups is non-empty (i.e. we have real
+        # allreduce info); an empty set means no allreduce → no K-split.
+        # Guard: 2-D groups (group_y > 1) are never TP K-split.
+        for group in self.group_registry.groups:
+            if int(group.group_x) > 1 and int(group.group_y) == 1 and group.group_id in _allreduce_groups:
+                return group.group_id, int(group.group_x)
         return None, 1
 
     def _rewrite_scope(
@@ -380,6 +405,8 @@ class SoftwarePipelinePass(TileBindingPass):
             ForLoopCloseTemplate,
             ForLoopOpenTemplate,
             ForLoopOpenStridedTemplate,
+            IfCloseTemplate,
+            IfOpenTemplate,
         )
 
         num_stages = info["num_stages"]
@@ -391,6 +418,21 @@ class SoftwarePipelinePass(TileBindingPass):
         inner = bindings[i + 1:close_idx]
         load_bindings = [b for b in inner if b.op_kind == "load"
                          and b.operator_representation.get("dst") in load_buf_names]
+
+        # Track which loads are inside an if_open/if_close conditional block so
+        # the extracted prologue and prefetch loads can be wrapped in the same
+        # condition.  Without this, loads would become unconditional even though
+        # the original TileLang kernel scoped them with e.g. "if gid_x == gid_y".
+        _cond_stack: List[str] = []
+        _load_condition: Dict[int, Optional[str]] = {}  # id(binding) → condition
+        for b in inner:
+            if b.op_kind == "if_open":
+                _cond_stack.append(b.operator_representation.get("condition", ""))
+            elif b.op_kind == "if_close":
+                if _cond_stack:
+                    _cond_stack.pop()
+            elif b.op_kind == "load" and b.operator_representation.get("dst") in load_buf_names:
+                _load_condition[id(b)] = _cond_stack[-1] if _cond_stack else None
         compute_bindings = [b for b in inner if b.op_kind in ("gemm", "eltwise", "reduce")]
 
         # Detect TP K-split: multi-cluster group along the K dimension.
@@ -409,8 +451,8 @@ class SoftwarePipelinePass(TileBindingPass):
             return result, close_idx + 1
 
         # For TP K-split (block distribution): rank r handles bk in
-        # [r*tiles_per_rank, (r+1)*tiles_per_rank).  Prologue loads the first
-        # tile of this rank's block into _0.
+        # [r*tiles_per_rank, (r+1)*tiles_per_rank).  Prologue loads from the
+        # start of that rank's contiguous block into _0.
         # For non-TP: prologue loads from bk=0 into _0 (existing behaviour).
         if tp_group_id:
             tiles_per_rank = extent // tp_stride  # exact integer division
@@ -424,22 +466,30 @@ class SoftwarePipelinePass(TileBindingPass):
             tp_end_expr    = None
             prologue_subst = "0"
 
-        # ---- Prologue: load stage 0 (or cluster-specific stage) before the loop ----
+        # ---- Prologue: load stage 0 (cluster-specific K offset) before loop ----
         for lb in load_bindings:
             orig_dst = lb.operator_representation["dst"]
             rep = dict(lb.operator_representation)
             rep["dst"] = f"{orig_dst}_0"
             rep["src_offset"] = self._subst_loop_var(
                 rep.get("src_offset", 0), loop_var, prologue_subst)
+            cond = _load_condition.get(id(lb))
+            if cond:
+                result.append(TileBinding(op_kind="if_open", template=IfOpenTemplate,
+                                          operator_representation={"condition": cond,
+                                                                    "cluster_id": None}))
             result.append(TileBinding(op_kind="load", template=lb.template,
                                       operator_representation=rep))
+            if cond:
+                result.append(TileBinding(op_kind="if_close", template=IfCloseTemplate,
+                                          operator_representation={"cluster_id": None}))
         result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
                                   operator_representation={"cluster_id": None}))
 
         # ---- Main loop open ----
         if tp_group_id:
-            # TP K-split block distribution: each rank iterates over its
-            # contiguous slice [rank*tiles_per_rank, (rank+1)*tiles_per_rank).
+            # TP block distribution: each rank iterates over its contiguous
+            # slice [rank*tiles_per_rank, (rank+1)*tiles_per_rank).
             rep_open = {
                 "loop_var":  loop_var,
                 "min_val":   tp_start_expr,
@@ -464,10 +514,8 @@ class SoftwarePipelinePass(TileBindingPass):
             orig_dst = lb.operator_representation["dst"]
             dtype = buf_dtypes.get(orig_dst, "fp16")
             if tp_group_id:
-                # TP block distribution: alternate buffers relative to the start
-                # of this rank's range so _0 always corresponds to the prologue.
-                # (bk - rank*tiles_per_rank) % num_stages selects stage correctly
-                # regardless of which rank this cluster is.
+                # Block distribution: stage alternates relative to rank's block
+                # start so _0 always corresponds to the prologue regardless of rank.
                 stage_lines.append(
                     f"{dtype}* {orig_dst}_cur = (({loop_var} - {tp_start_expr}) % {num_stages} == 0) "
                     f"? {orig_dst}_0 : {orig_dst}_1;")
@@ -490,7 +538,7 @@ class SoftwarePipelinePass(TileBindingPass):
         ))
 
         # ---- Prefetch loads (DM core): load next stage, guarded ----
-        # For TP block: next iteration is bk+1, guard against rank's end.
+        # For TP block: next iteration is bk+1, guard against rank's block end.
         next_bk_expr = f"{loop_var} + 1"
         guard_expr = f"{next_bk_expr} < {tp_end_expr}" if tp_group_id else f"{next_bk_expr} < {extent}"
         for lb in load_bindings:
@@ -499,23 +547,69 @@ class SoftwarePipelinePass(TileBindingPass):
             rep["dst"] = f"{orig_dst}_nxt"
             rep["src_offset"] = self._subst_loop_var(
                 rep.get("src_offset", 0), loop_var, next_bk_expr)
-            # Wrap load body in a guard
-            inner_src = lb.template.template._source
-            guarded_src = f"if ({guard_expr}) {{\n{inner_src}}}\n"
-            result.append(TileBinding(
-                op_kind="load",
-                template=NodeTemplate(guarded_src),
-                operator_representation=rep,
-            ))
+            cond = _load_condition.get(id(lb))
+            if cond:
+                # Load was originally inside a conditional: emit
+                #   if (guard) { if (cond) { load } }
+                # using proper if_open/if_close bindings so downstream passes
+                # (e.g. DedupSyncPass) see a consistent binding sequence.
+                result.append(TileBinding(op_kind="if_open", template=IfOpenTemplate,
+                                          operator_representation={"condition": guard_expr,
+                                                                    "cluster_id": None}))
+                result.append(TileBinding(op_kind="if_open", template=IfOpenTemplate,
+                                          operator_representation={"condition": cond,
+                                                                    "cluster_id": None}))
+                result.append(TileBinding(op_kind="load", template=lb.template,
+                                          operator_representation=rep))
+                result.append(TileBinding(op_kind="if_close", template=IfCloseTemplate,
+                                          operator_representation={"cluster_id": None}))
+                result.append(TileBinding(op_kind="if_close", template=IfCloseTemplate,
+                                          operator_representation={"cluster_id": None}))
+            else:
+                # Unconditional load: wrap body in guard only.
+                inner_src = lb.template.template._source
+                guarded_src = f"if ({guard_expr}) {{\n{inner_src}}}\n"
+                result.append(TileBinding(
+                    op_kind="load",
+                    template=NodeTemplate(guarded_src),
+                    operator_representation=rep,
+                ))
 
-        # ---- Compute bindings (compute core): use _cur buffers ----
-        for cb in compute_bindings:
-            rep = dict(cb.operator_representation)
-            for k in ("A", "B"):
-                if rep.get(k) in load_buf_names:
-                    rep[k] = f"{rep[k]}_cur"
-            result.append(TileBinding(op_kind=cb.op_kind, template=cb.template,
-                                      operator_representation=rep))
+        # ---- Main loop body: non-load bindings in original order ----
+        # Includes gemm/eltwise/reduce AND group_collective ops (group_shift,
+        # group_bcast_axis, etc.) so that directional collectives inside a
+        # T.Pipelined loop survive the double-buffering rewrite.
+        _pipelined_scope_kinds = {"pipelined_for_open", "pipelined_for_close"}
+        for b in inner:
+            if b.op_kind == "load" and b.operator_representation.get("dst") in load_buf_names:
+                continue  # promoted to prefetch stage above
+            if b.op_kind in _pipelined_scope_kinds:
+                continue  # handled by the outer scope logic
+            rep = dict(b.operator_representation)
+            # Remap staged load-buffer names to their _cur versions.
+            # Also handles prefixed variants (e.g. "DeeployNetwork_A_local" → "A_local_cur")
+            # that arise when the TIR buffer name includes the network prefix.
+            for key in ("A", "B", "src_name", "dst_name", "src_buffer", "dst_buffer"):
+                val = rep.get(key)
+                if not isinstance(val, str):
+                    continue
+                if val in load_buf_names:
+                    rep[key] = f"{val}_cur"
+                else:
+                    for _short in load_buf_names:
+                        if val.endswith("_" + _short):
+                            rep[key] = f"{_short}_cur"
+                            break
+            # Preserve CollectiveBinding subclass so CollectiveLoweringPass can dispatch.
+            from Deeploy.TileIR.IR.ParallelPasses import CollectiveBinding as _CollBind
+            if isinstance(b, _CollBind):
+                result.append(_CollBind(
+                    op_kind=b.op_kind, template=b.template,
+                    operator_representation=rep, spec=b.spec, op_name=b.op_name,
+                ))
+            else:
+                result.append(TileBinding(op_kind=b.op_kind, template=b.template,
+                                          operator_representation=rep))
 
         # ---- Single sync per iteration ----
         result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
@@ -526,6 +620,96 @@ class SoftwarePipelinePass(TileBindingPass):
                                   operator_representation={"loop_var": loop_var}))
 
         return result, close_idx + 1
+
+
+@dataclass
+class HoistAllocFreePass(TileBindingPass):
+    """Move alloc/free bindings outside the outermost for-loop nest.
+
+    Without this pass every (bx, by) tile iteration calls flex_l1_malloc /
+    flex_l1_free for the same fixed-size L1 scratch buffers.  Because buffer
+    sizes are loop-invariant, a single alloc before the loop and a single free
+    after it are correct and eliminate the per-iteration allocator overhead.
+
+    Must run after SoftwarePipelinePass (so double-buffer _0/_1 splits exist)
+    and before GlobalClusterBarrierPass.
+    """
+
+    def apply(self, bindings: List[TileBinding]) -> List[TileBinding]:
+        # Find the first for_open (outermost loop)
+        outer_open_idx = None
+        for i, b in enumerate(bindings):
+            if b.op_kind in ("for_open", "pipelined_for_open"):
+                outer_open_idx = i
+                break
+        if outer_open_idx is None:
+            return bindings
+
+        # Find the matching for_close
+        depth = 0
+        outer_close_idx = None
+        for i in range(outer_open_idx, len(bindings)):
+            if bindings[i].op_kind in ("for_open", "pipelined_for_open"):
+                depth += 1
+            elif bindings[i].op_kind in ("for_close", "pipelined_for_close"):
+                depth -= 1
+                if depth == 0:
+                    outer_close_idx = i
+                    break
+        if outer_close_idx is None:
+            return bindings
+
+        hoisted_allocs: List[TileBinding] = []
+        hoisted_frees: List[TileBinding] = []
+        loop_body: List[TileBinding] = []
+
+        for b in bindings[outer_open_idx:outer_close_idx + 1]:
+            if b.op_kind == "alloc":
+                hoisted_allocs.append(b)
+            elif b.op_kind == "free":
+                hoisted_frees.append(b)
+            else:
+                loop_body.append(b)
+
+        return (bindings[:outer_open_idx]
+                + hoisted_allocs
+                + loop_body
+                + hoisted_frees
+                + bindings[outer_close_idx + 1:])
+
+
+@dataclass
+class DedupSyncPass(TileBindingPass):
+    """Collapse runs of consecutive ``flex_intra_cluster_sync()`` bindings.
+
+    Multiple passes emit intra-cluster syncs independently — the visitor
+    appends one after every load/copy/gemm/reduce/fill/eltwise, and
+    ``SoftwarePipelinePass`` adds one per pipelined-loop iteration.  After
+    promoting prefetch loads out of the loop body, several visitor-emitted
+    syncs can end up adjacent.  This pass keeps only the first of each run.
+
+    Only intra-cluster syncs are collapsed; global barriers and group
+    barriers use distinct templates and are left untouched.
+    """
+
+    def apply(self, bindings: List[TileBinding]) -> List[TileBinding]:
+        from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
+            TileSyncTemplate,
+        )
+        intra_sync_templates = {TileSyncTemplate, _INTRA_CLUSTER_SYNC_TEMPLATE}
+
+        def _is_intra_sync(b: TileBinding) -> bool:
+            return b.op_kind == "sync" and b.template in intra_sync_templates
+
+        result: List[TileBinding] = []
+        prev_was_intra_sync = False
+        for b in bindings:
+            cur_is_intra_sync = _is_intra_sync(b)
+            if cur_is_intra_sync and prev_was_intra_sync:
+                continue
+            result.append(b)
+            prev_was_intra_sync = cur_is_intra_sync
+        return result
 
 
 @dataclass
@@ -540,7 +724,9 @@ class TileBindingPipeline:
         if self.binding_passes is None:
             self.binding_passes = [
                 SoftwarePipelinePass(group_registry=self.group_registry),
+                HoistAllocFreePass(),
                 GlobalClusterBarrierPass(),
+                DedupSyncPass(),
             ]
 
     def add(self, binding: TileBinding) -> None:
