@@ -46,6 +46,7 @@ from Deeploy.DeeployTypes import (
     NodeTemplate,
     _NoVerbosity,
 )
+from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import TileGroupBarrierTemplate
 from Deeploy.TileIR.Backend.Transformations import get_tile_op_transformer
 
 if TYPE_CHECKING:
@@ -174,6 +175,47 @@ _INTRA_CLUSTER_SYNC_TEMPLATE = NodeTemplate("flex_intra_cluster_sync();\n")
 
 
 @dataclass
+class ScopePhases:
+    """Classification of bindings inside a T.Pipelined scope.
+
+    Separates the scope body into three schedulable phases so the pipeline
+    rewriter can map each phase to the correct pipeline slot (prologue,
+    prefetch, compute body).
+
+    Attributes
+    ----------
+    loads : List[TileBinding]
+        ``load`` bindings that write to staged (double-buffered) buffers.
+    comms : List[TileBinding]
+        ``CollectiveBinding`` ops (bcast_axis, shift, …) whose ``src_buffer``
+        is a staged buffer.  These are moved into the prefetch slot alongside
+        the loads so the DM core can disseminate the next tile while the
+        compute core runs GEMM on the current tile.
+    follow_syncs : List[TileBinding]
+        ``sync`` bindings that immediately follow a promoted load or COMM.
+        These guarded the old "load → sync → GEMM" pattern; after pipeline
+        rewriting the compute core reads ``_cur`` so they are redundant and
+        must be excluded to allow DM/compute overlap.
+    empty_conditionals : List[TileBinding]
+        ``if_open`` / ``if_close`` bindings whose entire contents were promoted
+        (loads + comms + follow_syncs).  Keeping these would produce empty
+        ``if (...) {}`` ghost blocks in the output, so they are excluded.
+    conditional_map : Dict[int, Optional[str]]
+        Maps ``id(binding)`` → the innermost ``if_open`` condition that lexically
+        wraps the binding (or ``None`` if unconditional).
+    staged_buffers : Set[str]
+        The set of L1 buffer names that are double-buffered.
+    """
+
+    loads: List["TileBinding"]
+    comms: List["TileBinding"]
+    follow_syncs: List["TileBinding"]
+    empty_conditionals: List["TileBinding"]
+    conditional_map: Dict[int, Optional[str]]
+    staged_buffers: Set[str]
+
+
+@dataclass
 class SoftwarePipelinePass(TileBindingPass):
     """Transform ``pipelined_for_open`` scopes into double-buffer software pipeline.
 
@@ -181,28 +223,31 @@ class SoftwarePipelinePass(TileBindingPass):
     ``num_stages >= 2``:
 
     1. Duplicate every L1 load-target buffer (A_local → A_local_0, A_local_1).
-    2. Emit a **prologue** that loads stage 0 before the loop (ONE sync).
-    3. Rewrite the loop body so the DM core prefetches stage ``(bk+1)%2`` while
-       the compute core runs GEMM on stage ``bk%2`` — both run concurrently
-       between the single ``flex_intra_cluster_sync()`` per iteration.
+    2. Classify the scope body via ``_classify_phases`` into three phases:
 
-    The DM core and RedMule / compute cores are distinct hardware cores inside a
-    SoftHier cluster and execute concurrently between ``flex_intra_cluster_sync``
-    calls.  No async DMA API is required.
+       * **LOAD** — ``load`` ops writing to staged buffers.
+       * **COMM** — ``CollectiveBinding`` ops (``bcast_axis``, ``shift``, …)
+         whose ``src_buffer`` is a staged buffer.
+       * **COMPUTE** — ``gemm`` / ``eltwise`` / ``reduce`` ops plus any
+         remaining pass-through bindings.
+
+    3. Emit a **prologue** that runs ``[LOAD(_0) + COMM(_0)]`` before the loop
+       then a single ``flex_intra_cluster_sync()``.  This ensures the first
+       tile is fully loaded *and* disseminated before compute begins.
+    4. Rewrite the loop body as::
+
+           [LOAD_nxt + COMM_nxt]  (DM core, guarded by bk+1 < extent)
+           COMPUTE_cur            (compute core, overlaps with DM above)
+           flex_intra_cluster_sync()
+
+       The DM core prefetches *and* broadcasts the next tile concurrently with
+       the compute core running GEMM on the current tile.  For SUMMA / Cannon
+       this eliminates the serialized bcast-then-GEMM pattern and overlaps the
+       inter-cluster communication with arithmetic.
 
     When *group_registry* is provided and a pipelined scope belongs to a
-    multi-cluster group (``group_x > 1``), a **K-split** strided loop is emitted
-    instead of a plain loop:
-
-    * Prologue loads from ``bk = cluster_in_group_id_x_<gid>`` (per-cluster
-      K-offset) into stage 0.
-    * Main loop runs ``for (bk = cluster_in_group_id_x_<gid>; bk < extent;
-      bk += group_x)``.  Each cluster handles every ``group_x``-th K-block.
-    * Prefetch guard and offset use the strided step.
-
-    This fixes the 2× numerical error in TP-GEMM where without K-split both
-    clusters accumulate the full K sum, causing the allreduce to double the
-    result.
+    multi-cluster group (``group_x > 1``) with an allreduce collective, a
+    **K-split** strided loop is emitted instead of a plain loop.
     """
 
     group_registry: Optional["ClusterGroupRegistry"] = None
@@ -392,6 +437,86 @@ class SoftwarePipelinePass(TileBindingPass):
                 return group.group_id, int(group.group_x)
         return None, 1
 
+    @staticmethod
+    def _classify_phases(inner: List[TileBinding], load_buf_names: Set[str]) -> "ScopePhases":
+        """Classify bindings inside a pipelined scope into pipeline phases.
+
+        Returns a ``ScopePhases`` with:
+
+        * ``loads`` — ``load`` bindings writing to staged buffers.
+        * ``comms`` — ``CollectiveBinding`` ops whose ``spec.src_buffer`` is a
+          staged buffer.  These are moved into the prefetch slot alongside loads
+          so the DM core can disseminate the next tile while the compute core
+          runs GEMM on the current tile concurrently.
+        * ``conditional_map`` — maps ``id(binding)`` to the innermost
+          ``if_open`` condition lexically enclosing it, or ``None``.
+        """
+        from Deeploy.TileIR.IR.ParallelPasses import CollectiveBinding as _CB
+
+        loads = [b for b in inner
+                 if b.op_kind == "load" and b.operator_representation.get("dst") in load_buf_names]
+        comms = [b for b in inner
+                 if isinstance(b, _CB) and b.spec is not None
+                 and b.spec.src_buffer in load_buf_names]
+
+        staged_ids = {id(b) for b in loads + comms}
+        cond_stack: List[str] = []
+        conditional_map: Dict[int, Optional[str]] = {}
+        # Collect sync bindings that immediately follow a promoted load or COMM.
+        # These syncs guarded the old "load → sync → GEMM" pattern; after
+        # pipeline rewriting GEMM reads _cur (previous iteration), so they are
+        # redundant and must be excluded to allow DM/compute overlap.
+        follow_syncs: List[TileBinding] = []
+        prev_was_staged = False
+        for b in inner:
+            if b.op_kind == "if_open":
+                cond_stack.append(b.operator_representation.get("condition", ""))
+            elif b.op_kind == "if_close":
+                if cond_stack:
+                    cond_stack.pop()
+
+            if id(b) in staged_ids:
+                conditional_map[id(b)] = cond_stack[-1] if cond_stack else None
+                prev_was_staged = True
+            elif b.op_kind == "sync" and prev_was_staged:
+                follow_syncs.append(b)
+                # Keep prev_was_staged True: run of consecutive follow-syncs all excluded
+            else:
+                prev_was_staged = False
+
+        # Detect if_open/if_close pairs whose contents are entirely promoted.
+        # Keeping such pairs would produce empty "if (...) {}" ghost blocks.
+        all_promoted_ids = {id(b) for b in loads + comms + follow_syncs}
+        empty_conditionals: List[TileBinding] = []
+        idx = 0
+        while idx < len(inner):
+            b = inner[idx]
+            if b.op_kind == "if_open":
+                depth = 1
+                j = idx + 1
+                while j < len(inner) and depth > 0:
+                    if inner[j].op_kind == "if_open":
+                        depth += 1
+                    elif inner[j].op_kind == "if_close":
+                        depth -= 1
+                    j += 1
+                close_j = j - 1  # index of the matching if_close
+                contents = inner[idx + 1:close_j]
+                non_structural = [c for c in contents if c.op_kind not in ("if_open", "if_close")]
+                if non_structural and all(id(c) in all_promoted_ids for c in non_structural):
+                    empty_conditionals.append(b)
+                    empty_conditionals.append(inner[close_j])
+            idx += 1
+
+        return ScopePhases(
+            loads=loads,
+            comms=comms,
+            follow_syncs=follow_syncs,
+            empty_conditionals=empty_conditionals,
+            conditional_map=conditional_map,
+            staged_buffers=load_buf_names,
+        )
+
     def _rewrite_scope(
         self,
         bindings: List[TileBinding],
@@ -416,23 +541,9 @@ class SoftwarePipelinePass(TileBindingPass):
         close_idx = info["close_idx"]
 
         inner = bindings[i + 1:close_idx]
-        load_bindings = [b for b in inner if b.op_kind == "load"
-                         and b.operator_representation.get("dst") in load_buf_names]
-
-        # Track which loads are inside an if_open/if_close conditional block so
-        # the extracted prologue and prefetch loads can be wrapped in the same
-        # condition.  Without this, loads would become unconditional even though
-        # the original TileLang kernel scoped them with e.g. "if gid_x == gid_y".
-        _cond_stack: List[str] = []
-        _load_condition: Dict[int, Optional[str]] = {}  # id(binding) → condition
-        for b in inner:
-            if b.op_kind == "if_open":
-                _cond_stack.append(b.operator_representation.get("condition", ""))
-            elif b.op_kind == "if_close":
-                if _cond_stack:
-                    _cond_stack.pop()
-            elif b.op_kind == "load" and b.operator_representation.get("dst") in load_buf_names:
-                _load_condition[id(b)] = _cond_stack[-1] if _cond_stack else None
+        phases = self._classify_phases(inner, load_buf_names)
+        load_bindings = phases.loads
+        _load_condition = phases.conditional_map
         compute_bindings = [b for b in inner if b.op_kind in ("gemm", "eltwise", "reduce")]
 
         # Detect TP K-split: multi-cluster group along the K dimension.
@@ -466,7 +577,8 @@ class SoftwarePipelinePass(TileBindingPass):
             tp_end_expr    = None
             prologue_subst = "0"
 
-        # ---- Prologue: load stage 0 (cluster-specific K offset) before loop ----
+        # ---- Prologue: load stage 0 + disseminate (cluster-specific K offset) ----
+        from Deeploy.TileIR.IR.ParallelPasses import CollectiveBinding as _CollBind
         for lb in load_bindings:
             orig_dst = lb.operator_representation["dst"]
             rep = dict(lb.operator_representation)
@@ -483,6 +595,27 @@ class SoftwarePipelinePass(TileBindingPass):
             if cond:
                 result.append(TileBinding(op_kind="if_close", template=IfCloseTemplate,
                                           operator_representation={"cluster_id": None}))
+        # Emit COMM (bcast/shift) for stage 0 so the prologue tile is fully
+        # disseminated to all clusters before the loop starts.  The DM core on
+        # edge clusters completes flex_dma_async_wait_all() inside the template;
+        # the first iteration's group_barrier (at loop start) then provides the
+        # cross-cluster visibility guarantee.
+        comm_group_id: Optional[str] = phases.comms[0].spec.group_id if phases.comms else None
+        for cb in phases.comms:
+            orig_buf = cb.spec.src_buffer
+            rep = dict(cb.operator_representation)
+            rep["src_name"] = f"{orig_buf}_0"
+            rep["dst_name"] = f"{orig_buf}_0"
+            result.append(_CollBind(
+                op_kind="group_collective",
+                template=cb.template,
+                operator_representation=rep,
+                spec=cb.spec,
+                op_name=cb.op_name,
+            ))
+        # After prologue bcast, align DM and compute cores within each cluster.
+        # Cross-cluster visibility of bcast_0 is guaranteed by the group_barrier
+        # emitted at the start of loop iteration bk=0.
         result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
                                   operator_representation={"cluster_id": None}))
 
@@ -495,6 +628,7 @@ class SoftwarePipelinePass(TileBindingPass):
                 "min_val":   tp_start_expr,
                 "extent":    tp_end_expr,
                 "cluster_id": None,
+                "group_id": tp_group_id,
             }
             result.append(TileBinding(op_kind="for_open", template=ForLoopOpenTemplate,
                                       operator_representation=rep_open))
@@ -507,6 +641,27 @@ class SoftwarePipelinePass(TileBindingPass):
             }
             result.append(TileBinding(op_kind="for_open", template=ForLoopOpenTemplate,
                                       operator_representation=rep_open))
+
+        # ---- Sync segment at loop start (SUMMA-like pattern only) ----
+        # When the loop body contains cross-cluster COMM (bcast_axis / shift),
+        # the sync segment is placed at the START of each iteration (matching
+        # SummaGEMM.h lines 297-302):
+        #   grid_sync_group_barrier_xy  — waits for all clusters' DM cores to
+        #       finish broadcasting the previous tile (cross-cluster barrier)
+        #   flex_intra_cluster_sync     — aligns DM and compute cores within
+        #       the cluster before both start their next concurrent tasks
+        # After this sync, DM core starts load+bcast of the NEXT tile while
+        # compute core starts GEMM on the CURRENT tile — true overlap.
+        # The trailing sync is omitted; the next iteration's group_barrier
+        # acts as the implicit end-of-iteration barrier.
+        if comm_group_id:
+            result.append(TileBinding(
+                op_kind="sync",
+                template=TileGroupBarrierTemplate,
+                operator_representation={"group_id": comm_group_id, "cluster_id": None},
+            ))
+            result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
+                                      operator_representation={"cluster_id": None}))
 
         # ---- Stage pointer declarations (_cur / _nxt) ----
         stage_lines = []
@@ -575,14 +730,39 @@ class SoftwarePipelinePass(TileBindingPass):
                     operator_representation=rep,
                 ))
 
-        # ---- Main loop body: non-load bindings in original order ----
-        # Includes gemm/eltwise/reduce AND group_collective ops (group_shift,
-        # group_bcast_axis, etc.) so that directional collectives inside a
-        # T.Pipelined loop survive the double-buffering rewrite.
+        # ---- Prefetch COMM (DM core): disseminate next staged tile, guarded ----
+        # CollectiveBindings whose src buffer is staged are promoted here so
+        # the DM core broadcasts _nxt concurrently with compute-core GEMM on _cur.
+        # Each COMM binding is wrapped in if(bk+1 < extent) so the last iteration
+        # skips the disseminate (there is no "next" tile to broadcast).
+        for cb in phases.comms:
+            orig_buf = cb.spec.src_buffer
+            rep = dict(cb.operator_representation)
+            rep["src_name"] = f"{orig_buf}_nxt"
+            rep["dst_name"] = f"{orig_buf}_nxt"
+            result.append(TileBinding(op_kind="if_open", template=IfOpenTemplate,
+                                      operator_representation={"condition": guard_expr,
+                                                                "cluster_id": None}))
+            result.append(_CollBind(
+                op_kind="group_collective",
+                template=cb.template,
+                operator_representation=rep,
+                spec=cb.spec,
+                op_name=cb.op_name,
+            ))
+            result.append(TileBinding(op_kind="if_close", template=IfCloseTemplate,
+                                      operator_representation={"cluster_id": None}))
+
+        # ---- Main loop body: compute bindings in original order ----
+        # Excludes: loads (promoted to prefetch above), staged comms (promoted
+        # to prefetch+disseminate above), and pipelined scope markers.
         _pipelined_scope_kinds = {"pipelined_for_open", "pipelined_for_close"}
+        _skip_ids = {id(b) for b in phases.comms + phases.follow_syncs + phases.empty_conditionals}
         for b in inner:
             if b.op_kind == "load" and b.operator_representation.get("dst") in load_buf_names:
                 continue  # promoted to prefetch stage above
+            if id(b) in _skip_ids:
+                continue  # promoted comm, follow-sync, or empty ghost conditional
             if b.op_kind in _pipelined_scope_kinds:
                 continue  # handled by the outer scope logic
             rep = dict(b.operator_representation)
@@ -601,7 +781,6 @@ class SoftwarePipelinePass(TileBindingPass):
                             rep[key] = f"{_short}_cur"
                             break
             # Preserve CollectiveBinding subclass so CollectiveLoweringPass can dispatch.
-            from Deeploy.TileIR.IR.ParallelPasses import CollectiveBinding as _CollBind
             if isinstance(b, _CollBind):
                 result.append(_CollBind(
                     op_kind=b.op_kind, template=b.template,
@@ -611,9 +790,15 @@ class SoftwarePipelinePass(TileBindingPass):
                 result.append(TileBinding(op_kind=b.op_kind, template=b.template,
                                           operator_representation=rep))
 
-        # ---- Single sync per iteration ----
-        result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
-                                  operator_representation={"cluster_id": None}))
+        # ---- Trailing sync (non-COMM pipelines only) ----
+        # For SUMMA-like pipelines (comm_group_id set), the next iteration's
+        # group_barrier + flex_intra_cluster_sync at the loop START already
+        # provides the end-of-iteration barrier — no trailing sync needed.
+        # For TP / simple double-buffering (no cross-cluster COMM in the loop),
+        # emit the usual flex_intra_cluster_sync to align DM and compute.
+        if not comm_group_id:
+            result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
+                                      operator_representation={"cluster_id": None}))
 
         # ---- Main loop close ----
         result.append(TileBinding(op_kind="for_close", template=ForLoopCloseTemplate,

@@ -191,12 +191,6 @@ if (flex_is_dm_core() && ${edge_flag}) {
     );
     flex_dma_async_wait_all();
 }
-% if _global_barrier:
-flex_global_barrier_xy();
-% else:
-// All group members sync (non-edge waits for edge to finish)
-grid_sync_group_barrier_xy(&group_info_${group_id});
-% endif
 """
 
 TileCollectiveReduceTemplate = NodeTemplate(TileCollectiveReduceTemplateStr)
@@ -219,9 +213,10 @@ TileCollectiveBroadcastTemplateStr = r"""<%
 _global_barrier = context.get('global_barrier', False)
 %>
 % if _global_barrier:
+// Cross-group sync before broadcast (global pattern: all clusters participate)
 flex_global_barrier_xy();
 % else:
-// All group members sync (non-edge waits for edge to finish broadcast)
+// All '${group_id}' members sync before broadcast starts
 grid_sync_group_barrier_xy(&group_info_${group_id});
 % endif
 // CollectiveBroadcast: edge cluster (${edge_flag}) -> all '${group_id}' members
@@ -235,12 +230,7 @@ if (flex_is_dm_core() && ${edge_flag}) {
     );
     flex_dma_async_wait_all();
 }
-% if _global_barrier:
-flex_global_barrier_xy();
-% else:
-// All group members sync (non-edge waits for edge to finish broadcast)
 grid_sync_group_barrier_xy(&group_info_${group_id});
-% endif
 """
 
 TileCollectiveBroadcastTemplate = NodeTemplate(TileCollectiveBroadcastTemplateStr)
@@ -335,7 +325,6 @@ TileCollectiveGroupShiftTemplate = NodeTemplate(TileCollectiveGroupShiftTemplate
 # ---------------------------------------------------------------------------
 
 TileCollectiveGroupBcastAxisTemplateStr = r"""
-grid_sync_group_barrier_xy(&group_info_${group_id});
 // GroupBcastAxis: broadcast ${src_name} along group '${group_id}' axis='${axis_name}' from rank ${from_coord}
 if (flex_is_dm_core() && ${edge_flag}) {
     flex_dma_async_broadcast(
@@ -347,7 +336,6 @@ if (flex_is_dm_core() && ${edge_flag}) {
     );
     flex_dma_async_wait_all();
 }
-grid_sync_group_barrier_xy(&group_info_${group_id});
 """
 
 TileCollectiveGroupBcastAxisTemplate = NodeTemplate(TileCollectiveGroupBcastAxisTemplateStr)
