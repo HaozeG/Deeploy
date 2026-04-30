@@ -271,6 +271,15 @@ class _ExprStringifier:
 _STRINGIFIER = _ExprStringifier()
 
 
+# parsing python condition string into C expression for if statement
+def parse_condition(cond_str: str) -> str:
+    # Simple replacements for common Python operators to C syntax
+    cond_str = re.sub(r"\band\b", "&&", cond_str)
+    cond_str = re.sub(r"\bor\b", "||", cond_str)
+    cond_str = re.sub(r"\bnot\b", "!", cond_str)
+    return cond_str
+
+
 # ---------------------------------------------------------------------------
 # Intrinsic call detection helpers
 # ---------------------------------------------------------------------------
@@ -380,6 +389,10 @@ class TilelangVisitor:
             "group_shift": self._handle_group_shift,
             "group_bcast_axis": self._handle_group_bcast_axis,
             "alloc_reducer": self._handle_alloc_reducer_intrinsic,
+            # tl.deeploy.* ops: keyed by full name to avoid collision with
+            # tl.tileop.reduce (element-wise TVM reduce) and tl.tileop.broadcast.
+            "tl.deeploy.reduce": self._handle_dp_reduce,
+            "tl.deeploy.broadcast": self._handle_dp_broadcast,
         }
 
     # ------------------------------------------------------------------
@@ -900,8 +913,13 @@ class TilelangVisitor:
                 val = getattr(node, "value", None)
                 if val is not None and type(val).__name__ == "Call":
                     op_obj = getattr(val, "op", None)
-                    op_name = str(getattr(op_obj, "name", "")).split(".")[-1] if op_obj else ""
-                    if op_name in ("allreduce", "collective", "group_shift", "group_bcast_axis"):
+                    full_op_name = str(getattr(op_obj, "name", "")) if op_obj else ""
+                    op_name = full_op_name.split(".")[-1]
+                    _legacy_collective = op_name in (
+                        "allreduce", "collective", "group_shift", "group_bcast_axis",
+                    )
+                    _deeploy_collective = full_op_name.startswith("tl.deeploy.")
+                    if _legacy_collective or _deeploy_collective:
                         # Priority 1: enclosing cluster_group AttrStmt scope.
                         # Priority 2: group_id encoded directly in the call args.
                         gid = in_group or _extract_group_from_call(val)
@@ -1181,7 +1199,7 @@ class TilelangVisitor:
 
     def _visit_IfThenElse(self, stmt, cluster_id):
         cond_str = _STRINGIFIER.stringify(stmt.condition)
-        self._emit_binding("if_open", IfOpenTemplate, {"condition": cond_str, "cluster_id": None})
+        self._emit_binding("if_open", IfOpenTemplate, {"condition": parse_condition(cond_str), "cluster_id": None})
         if stmt.then_case is not None:
             self._visit_stmt(stmt.then_case, cluster_id)
         if stmt.else_case is not None:
@@ -1190,23 +1208,25 @@ class TilelangVisitor:
         self._emit_binding("if_close", IfCloseTemplate, {"cluster_id": None})
 
     def _visit_Evaluate(self, stmt, cluster_id):
-        # op
         """Dispatch based on the intrinsic call inside."""
         value = stmt.value
         if not hasattr(value, "op"):
             return
-        op_str = str(value.op.name).split(".")[-1] if hasattr(value.op, "name") else ""
-        args   = list(value.args) if hasattr(value, "args") else []
+        full_op = str(value.op.name) if hasattr(value.op, "name") else ""
+        op_str  = full_op.split(".")[-1]
+        args    = list(value.args) if hasattr(value, "args") else []
 
-        handler = self._supported_ops.get(op_str)
+        # Full-name lookup first so namespaced ops (tl.deeploy.*) never collide
+        # with same-suffix tl.tileop.* ops (e.g. "reduce", "broadcast").
+        handler = self._supported_ops.get(full_op) or self._supported_ops.get(op_str)
         if handler:
             handler(args, cluster_id)
         else:
             # Unknown intrinsic — emit a comment
-            print(f"[TilelangVisitor] Warning: unhandled intrinsic call: {op_str}")
+            print(f"[TilelangVisitor] Warning: unhandled intrinsic call: {full_op}")
             self._emit_binding(
                 "comment",
-                NodeTemplate(f"// Unhandled intrinsic: {op_str}\n"),
+                NodeTemplate(f"// Unhandled intrinsic: {full_op}\n"),
                 {
                     "cluster_id": self._resolve_cluster(cluster_id)[0],
                     "metadata": self._op_metadata(cluster_id)[1],
@@ -1888,6 +1908,206 @@ class TilelangVisitor:
             "shard_metadata":   shard_meta,
         }
         self._emit_binding("alloc_reducer", TileAllocReducerTemplate, rep)
+
+    # ------------------------------------------------------------------
+    # D.reduce / D.broadcast handlers (tl.deeploy.* ops)
+    # ------------------------------------------------------------------
+
+    def _validate_dp_axis(self, op_name: str, group_id: str, level: str, axis,
+                          require_axis_for_inter: bool = False):
+        """Validate axis name against the registry for D.reduce / D.broadcast."""
+        if self.group_registry is None or not self.group_registry.contains(group_id):
+            return
+        grp = self.group_registry.get(group_id)
+        if level == "intra_group":
+            if axis is not None and axis not in grp.axis_names:
+                raise ValueError(
+                    f"{op_name}: axis={axis!r} not in group '{group_id}' "
+                    f"intra-group axis_names={grp.axis_names!r}"
+                )
+            if grp.group_x > 1 and grp.group_y > 1 and axis is None:
+                raise ValueError(
+                    f"{op_name}: axis is required for level='intra_group' "
+                    f"on 2-D group '{group_id}' (axis_names={grp.axis_names!r})"
+                )
+        elif level == "inter_group":
+            if require_axis_for_inter and grp.meta_axes and axis is None:
+                raise ValueError(
+                    f"{op_name}: axis is required for level='inter_group' "
+                    f"when group '{group_id}' declares meta_axes={grp.meta_axes!r}"
+                )
+            if axis is not None and grp.meta_axes and axis not in grp.meta_axes:
+                raise ValueError(
+                    f"{op_name}: axis={axis!r} not in group '{group_id}' "
+                    f"meta_axes={grp.meta_axes!r}"
+                )
+
+    def _handle_dp_reduce(self, args: list, cluster_id):
+        """D.reduce(buf, op, level, axis, group, root) → collective reduce binding.
+
+        Argument layout (matches tl_deeploy.reduce intrinsic encoding):
+          args[0] : buf_region   (BufferRegion, access_type="rw")
+          args[1] : StringImm(op)      — "sum"|"max"|"min"|"prod"
+          args[2] : StringImm(level)   — "intra_group"|"inter_group"
+          args[3] : StringImm(axis)    — axis name or ""
+          args[4] : StringImm(group)   — group_id
+          args[5] : StringImm(root)    — "" (allreduce) or C-expression string
+        """
+        if len(args) < 5:
+            print("[TilelangVisitor] Warning: tl.deeploy.reduce: too few arguments; skipping.")
+            return
+
+        buf_name = self._region_buf_name(args[0]) if hasattr(args[0], "args") else str(args[0])
+        reduce_op  = str(args[1]).strip('"') if len(args) > 1 else "sum"
+        level      = str(args[2]).strip('"') if len(args) > 2 else "intra_group"
+        axis_arg   = str(args[3]).strip('"') if len(args) > 3 else ""
+        group_id   = str(args[4]).strip('"') if len(args) > 4 else ""
+        root_arg   = str(args[5]).strip('"') if len(args) > 5 else ""
+
+        group_id = group_id or self._current_group_id
+        if not group_id:
+            print("[TilelangVisitor] Warning: D.reduce(): no group_id; skipping.")
+            return
+
+        axis = axis_arg if axis_arg else None
+
+        self._validate_dp_axis("D.reduce", group_id, level, axis,
+                               require_axis_for_inter=True)
+
+        # For inter_group reductions use inverted masks + global barrier (split-K pattern).
+        global_barrier_before = (level == "inter_group")
+
+        spec = CollectiveOpSpec(
+            op="dp_reduce",
+            group_id=group_id,
+            src_buffer=buf_name,
+            dst_buffer=buf_name,
+            reduce_op=reduce_op,
+            # Legacy field kept for AxisReduceBroadcast compatibility:
+            # inter_group maps to inverted-mask path; intra_group uses axis directly.
+            reduce_axis=axis,
+            global_barrier_before=global_barrier_before,
+            level=level,
+            axis=axis,
+            root_expr=root_arg,
+        )
+
+        shard_meta = self._make_shard_metadata()
+        if shard_meta is None and group_id:
+            shard_meta = ShardMetadata(group_id=group_id)
+        rep = {
+            "src_name":       buf_name,
+            "dst_name":       buf_name,
+            "op":             "dp_reduce",
+            "group_id":       group_id,
+            "nbytes":         0,
+            "cluster_id":     None,
+            "shard_metadata": shard_meta,
+        }
+        self._emit_binding(
+            "group_collective",
+            NodeTemplate(
+                f"// D.reduce({buf_name}, op={reduce_op}, level={level}, "
+                f"axis={axis}) — lowered by CollectiveLoweringPass\n"
+            ),
+            rep,
+        )
+        if self._bindings is not None:
+            last = self._bindings.bindings[-1]
+            cb = CollectiveBinding(
+                op_kind="group_collective",
+                template=last.template,
+                operator_representation=rep,
+                op_name=f"tile_dp_reduce_{buf_name}_{group_id}",
+                spec=spec,
+            )
+            self._bindings.bindings[-1] = cb
+
+    def _handle_dp_broadcast(self, args: list, cluster_id):
+        """D.broadcast(buf, level, axis, group, root) → collective broadcast binding.
+
+        Argument layout (matches tl_deeploy.broadcast intrinsic encoding):
+          args[0] : buf_region   (BufferRegion, access_type="rw")
+          args[1] : StringImm(level) — "intra_group"|"inter_group"
+          args[2] : StringImm(axis)  — axis name or ""
+          args[3] : StringImm(group) — group_id
+          args[4] : StringImm(root)  — C-expression string (required)
+        """
+        if len(args) < 4:
+            print("[TilelangVisitor] Warning: tl.deeploy.broadcast: too few arguments; skipping.")
+            return
+
+        buf_name = self._region_buf_name(args[0]) if hasattr(args[0], "args") else str(args[0])
+        level    = str(args[1]).strip('"') if len(args) > 1 else "intra_group"
+        axis_arg = str(args[2]).strip('"') if len(args) > 2 else ""
+        group_id = str(args[3]).strip('"') if len(args) > 3 else ""
+        root_arg = str(args[4]).strip('"') if len(args) > 4 else ""
+
+        group_id = group_id or self._current_group_id
+        if not group_id:
+            print("[TilelangVisitor] Warning: D.broadcast(): no group_id; skipping.")
+            return
+        if not root_arg:
+            print(f"[TilelangVisitor] Warning: D.broadcast({buf_name}): root is empty; skipping.")
+            return
+
+        axis = axis_arg if axis_arg else None
+
+        self._validate_dp_axis("D.broadcast", group_id, level, axis)
+
+        # root_arg is a C-expression string (e.g. "gid_y", "0").
+        # Map to from_coord_expr (dynamic) or from_coord (static int).
+        try:
+            from_coord_static = int(root_arg)
+            from_coord_expr_val = None
+        except (ValueError, TypeError):
+            from_coord_static = 0
+            from_coord_expr_val = root_arg
+
+        spec = CollectiveOpSpec(
+            op="dp_broadcast",
+            group_id=group_id,
+            src_buffer=buf_name,
+            dst_buffer=buf_name,
+            # Legacy directional fields used by DpBroadcastStrategy:
+            reduce_axis=axis,
+            from_coord=from_coord_static,
+            from_coord_expr=from_coord_expr_val,
+            level=level,
+            axis=axis,
+            root_expr=root_arg,
+        )
+
+        shard_meta = self._make_shard_metadata()
+        if shard_meta is None and group_id:
+            shard_meta = ShardMetadata(group_id=group_id)
+        rep = {
+            "src_name":       buf_name,
+            "dst_name":       buf_name,
+            "op":             "dp_broadcast",
+            "group_id":       group_id,
+            "nbytes":         0,
+            "cluster_id":     None,
+            "shard_metadata": shard_meta,
+        }
+        self._emit_binding(
+            "group_collective",
+            NodeTemplate(
+                f"// D.broadcast({buf_name}, level={level}, axis={axis}, "
+                f"root={root_arg}) — lowered by CollectiveLoweringPass\n"
+            ),
+            rep,
+        )
+        if self._bindings is not None:
+            last = self._bindings.bindings[-1]
+            cb = CollectiveBinding(
+                op_kind="group_collective",
+                template=last.template,
+                operator_representation=rep,
+                op_name=f"tile_dp_broadcast_{buf_name}_{group_id}",
+                spec=spec,
+            )
+            self._bindings.bindings[-1] = cb
 
     # ------------------------------------------------------------------
     # Region helpers

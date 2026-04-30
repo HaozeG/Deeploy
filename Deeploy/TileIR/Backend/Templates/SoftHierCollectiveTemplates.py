@@ -180,7 +180,7 @@ grid_sync_group_barrier_xy(&group_info_${group_id});
 % endif
 // CollectiveReduce: ${collective_op_kind} over group '${group_id}'
 // Edge cluster (${edge_flag}) accumulates ${src_name} -> ${dst_name}
-if (flex_is_dm_core() && ${edge_flag}) {
+if (flex_is_dm_core()) {
     flex_dma_async_reduction(
         (uint32_t)(uintptr_t)${dst_name},
         (uint32_t)(uintptr_t)${src_name},
@@ -220,7 +220,7 @@ flex_global_barrier_xy();
 grid_sync_group_barrier_xy(&group_info_${group_id});
 % endif
 // CollectiveBroadcast: edge cluster (${edge_flag}) -> all '${group_id}' members
-if (flex_is_dm_core() && ${edge_flag}) {
+if (flex_is_dm_core()) {
     flex_dma_async_broadcast(
         (uint32_t)(uintptr_t)${dst_name},
         (uint32_t)(uintptr_t)${src_name},

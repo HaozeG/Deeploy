@@ -4,6 +4,7 @@
 
 """TileIR Frontend — TileLang AST → Deeploy ExecutionBlock."""
 
+from Deeploy.TileIR.Frontend import tl_deeploy
 from Deeploy.TileIR.Frontend.TilelangVisitor import TilelangVisitor
 from Deeploy.TileIR.IR import (
     ClusterGroup,
@@ -18,6 +19,7 @@ from Deeploy.TileIR.IR import (
 )
 
 __all__ = [
+    "tl_deeploy",
     "TilelangVisitor",
     "ClusterGroup",
     "ClusterGroupRegistry",

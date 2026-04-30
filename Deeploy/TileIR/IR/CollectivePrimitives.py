@@ -30,6 +30,7 @@ ShardMetadata
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -69,6 +70,11 @@ class ClusterGroup:
     axis_names: Tuple[str, str] = ("x", "y")
     root_coord: Tuple[int, int] = (0, 0)
     physical_cluster_ids: Optional[List[int]] = None
+    # Meta-grid: how num_groups instances are arranged across one or more named axes.
+    # Required when num_groups > 1 and inter-group collectives are used.
+    # meta_shape must satisfy prod(meta_shape) == num_groups.
+    meta_axes: Tuple[str, ...] = ()
+    meta_shape: Tuple[int, ...] = ()
 
     def __post_init__(self):
         if self.group_x < 1 or self.group_y < 1:
@@ -81,6 +87,24 @@ class ClusterGroup:
                 f"ClusterGroup '{self.group_id}': num_groups must be >= 1, "
                 f"got num_groups={self.num_groups}"
             )
+        if self.meta_axes or self.meta_shape:
+            if len(self.meta_axes) != len(self.meta_shape):
+                raise ValueError(
+                    f"ClusterGroup '{self.group_id}': meta_axes and meta_shape must have "
+                    f"the same length, got {self.meta_axes!r} vs {self.meta_shape!r}"
+                )
+            meta_prod = math.prod(self.meta_shape)
+            if meta_prod != self.num_groups:
+                raise ValueError(
+                    f"ClusterGroup '{self.group_id}': prod(meta_shape)={meta_prod} "
+                    f"must equal num_groups={self.num_groups}"
+                )
+            for name in self.meta_axes:
+                if name in self.axis_names:
+                    raise ValueError(
+                        f"ClusterGroup '{self.group_id}': meta_axis '{name}' shadows "
+                        f"an intra-group axis name in axis_names={self.axis_names!r}"
+                    )
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -259,6 +283,15 @@ class CollectiveOpSpec:
     from_coord: int = 0
     from_coord_expr: Optional[str] = None
     global_barrier_before: bool = False
+    # Explicit scope fields for D.reduce / D.broadcast (tl.deeploy.*).
+    # When set, strategies dispatch on (level, axis) instead of inferring from op name.
+    #   level: "intra_group" | "inter_group"
+    #   axis:  intra-group axis name (from ClusterGroup.axis_names) or
+    #          inter-group meta-axis name (from ClusterGroup.meta_axes), or None
+    #   root_expr: C expression for source rank; "" means allreduce
+    level: Optional[str] = None
+    axis: Optional[str] = None
+    root_expr: str = ""
 
 
 @dataclass
@@ -322,6 +355,21 @@ def parse_cluster_group_spec(spec: str, registry: "ClusterGroupRegistry") -> str
         rc = kv["root"].split(",")
         root_coord = (int(rc[0]), int(rc[1]) if len(rc) > 1 else 0)
 
+    # Parse meta-grid axes and shape. If the annotation string omits these
+    # (upstream T.cluster_group doesn't emit them), preserve whatever the
+    # caller already registered in the registry so that a manually-built
+    # ClusterGroup with meta_axes is not silently overwritten.
+    meta_axes: Tuple[str, ...] = ()
+    meta_shape: Tuple[int, ...] = ()
+    if "meta_axes" in kv:
+        meta_axes = tuple(a.strip() for a in kv["meta_axes"].split(",") if a.strip())
+    if "meta_shape" in kv:
+        meta_shape = tuple(int(s.strip()) for s in kv["meta_shape"].split(",") if s.strip())
+    if not meta_axes and registry.contains(group_id):
+        _existing = registry.get(group_id)
+        meta_axes = _existing.meta_axes
+        meta_shape = _existing.meta_shape
+
     # Always register/update from the DSL spec so group shape (x, y, axis_names)
     # reflects the kernel annotation.  The actual num_active_instances used for
     # cluster_active is derived from HardwareBinding.active_instances() at
@@ -333,6 +381,8 @@ def parse_cluster_group_spec(spec: str, registry: "ClusterGroupRegistry") -> str
         num_groups=num_groups,
         axis_names=axis_names,
         root_coord=root_coord,
+        meta_axes=meta_axes,
+        meta_shape=meta_shape,
     )
     registry.register(group)
 

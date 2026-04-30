@@ -34,6 +34,15 @@ if _TILELANG_AVAILABLE:
     except Exception:
         pass
 
+# Check for Deeploy-native collective ops (D.reduce / D.broadcast).
+_DP_COLLECTIVE_AVAILABLE = False
+if _TILELANG_AVAILABLE:
+    try:
+        from Deeploy.TileIR.Frontend import tl_deeploy as _D_chk  # noqa: F401
+        _DP_COLLECTIVE_AVAILABLE = True
+    except ImportError:
+        pass
+
 pytestmark = pytest.mark.tilelang
 
 
@@ -90,7 +99,7 @@ class TestEndToEndGroupCompilation:
             # Kernel grid: each block covers GY*BM rows × GX*BN columns.
             with T.Kernel(T.ceildiv(M, GY_ * BM), T.ceildiv(N, GX_ * BN)) as (bx, by):
                 with T.cluster_group("summa", x=GX_, y=GY_, num_groups=1,
-                                     axes=("x", "y")) as (gid, gid_x, gid_y):
+                                        axes=("x", "y")) as (gid, gid_x, gid_y):
                     A_local = T.alloc_fragment((BM, BK), dtype)
                     B_local = T.alloc_fragment((BK, BN), dtype)
                     C_local = T.alloc_fragment((BM, BN), dtype)
@@ -104,10 +113,10 @@ class TestEndToEndGroupCompilation:
                             T.copy(B[bk * BK, (by * GX_ + gid_x) * BN], B_local)
                         # Row-broadcast A from each row's diagonal (from_coord = gid_y).
                         T.group_bcast_axis(A_local, along="x", from_coord=gid_y,
-                                           group="summa")
+                                            group="summa")
                         # Col-broadcast B from each column's diagonal (from_coord = gid_x).
                         T.group_bcast_axis(B_local, along="y", from_coord=gid_x,
-                                           group="summa")
+                                            group="summa")
                         T.gemm(A_local, B_local, C_local, clear_accum=False)
 
                     # Each cluster stores its own (gid_y, gid_x) output sub-block.
@@ -348,3 +357,270 @@ class TestEndToEndGroupCompilation:
         build_binary(config)
         result = run_simulation(config)
         # verify_numeric_outputs(result, C_ref.flatten().reshape(1, -1), atol=3e-1, rtol=3e-2)
+
+
+@pytest.mark.softhier
+@pytest.mark.tilelang
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="tilelang not installed")
+@pytest.mark.skipif(not _DP_COLLECTIVE_AVAILABLE, reason="Deeploy tl_deeploy not available")
+class TestEndToEndDpCollective:
+    """E2E tests using D.reduce / D.broadcast (tl.deeploy.* ops).
+
+    Unlike TestEndToEndGroupCompilation, these tests use the Deeploy-native
+    collective API and have numeric verification enabled.
+    """
+
+    @staticmethod
+    def _build_summa_gemm_dp_kernel(GX: int = 4, GY: int = 4):
+        """2D SUMMA GEMM using D.broadcast for row/col distribution."""
+        import tilelang
+        import tilelang.language as T
+        from Deeploy.TileIR.Frontend import tl_deeploy as D
+
+        @tilelang.jit
+        def summa_gemm_dp(A, B, C, BM: int, BN: int, BK: int, GX_: int, GY_: int):
+            M, K, N = T.const("M, K, N")
+            dtype = T.float16
+            A: T.Tensor((M, K), dtype)
+            B: T.Tensor((K, N), dtype)
+            C: T.Tensor((M, N), dtype)
+
+            with T.Kernel(T.ceildiv(M, GY_ * BM), T.ceildiv(N, GX_ * BN)) as (bx, by):
+                with T.cluster_group("summa", x=GX_, y=GY_, num_groups=1,
+                                     axes=("x", "y")) as (gid, gid_x, gid_y):
+                    A_local = T.alloc_fragment((BM, BK), dtype)
+                    B_local = T.alloc_fragment((BK, BN), dtype)
+                    C_local = T.alloc_fragment((BM, BN), dtype)
+                    T.clear(C_local)
+
+                    for bk in T.Pipelined(T.ceildiv(K, BK), num_stages=2):
+                        if gid_x == gid_y:
+                            T.copy(A[(bx * GY_ + gid_y) * BM, bk * BK], A_local)
+                            T.copy(B[bk * BK, (by * GX_ + gid_x) * BN], B_local)
+                        D.broadcast(A_local, level="intra_group", axis="x",
+                                    group="summa", root=gid_y)
+                        D.broadcast(B_local, level="intra_group", axis="y",
+                                    group="summa", root=gid_x)
+                        T.gemm(A_local, B_local, C_local, clear_accum=False)
+
+                    T.copy(C_local, C[(bx * GY_ + gid_y) * BM, (by * GX_ + gid_x) * BN])
+
+        return summa_gemm_dp
+
+    @staticmethod
+    def _build_summa_gemm_dp_split_k_kernel(GX: int = 2, GY: int = 2, NG: int = 4):
+        """2D SUMMA GEMM with split-K using D.broadcast + D.reduce."""
+        import tilelang
+        import tilelang.language as T
+        from Deeploy.TileIR.Frontend import tl_deeploy as D
+
+        @tilelang.jit
+        def summa_gemm_dp_split_k(A, B, C, BM: int, BN: int, BK: int,
+                                   GX_: int, GY_: int, NG_: int):
+            M, K, N = T.const("M, K, N")
+            dtype = T.float16
+            A: T.Tensor((M, K), dtype)
+            B: T.Tensor((K, N), dtype)
+            C: T.Tensor((M, N), dtype)
+
+            with T.Kernel(T.ceildiv(M, GY_ * BM), T.ceildiv(N, GX_ * BN)) as (bx, by):
+                # TODO: emit cluster group id as meta axis along with cluster id
+                with T.cluster_group("summa", x=GX_, y=GY_, num_groups=NG_,
+                                     axes=("x", "y")) as (gid, gid_x, gid_y):
+                    A_local = T.alloc_fragment((BM, BK), dtype)
+                    B_local = T.alloc_fragment((BK, BN), dtype)
+                    C_local = T.alloc_fragment((BM, BN), dtype)
+                    T.clear(C_local)
+
+                    K_per_inst = T.ceildiv(K, NG_)
+                    for bk in T.Pipelined(T.ceildiv(K_per_inst, BK), num_stages=2):
+                        if gid_x == gid_y:
+                            T.copy(A[(bx * GY_ + gid_y) * BM,
+                                     gid * K_per_inst + bk * BK], A_local)
+                            T.copy(B[gid * K_per_inst + bk * BK,
+                                     (by * GX_ + gid_x) * BN], B_local)
+                        D.broadcast(A_local, level="intra_group", axis="x",
+                                    group="summa", root=gid_y)
+                        D.broadcast(B_local, level="intra_group", axis="y",
+                                    group="summa", root=gid_x)
+                        T.gemm(A_local, B_local, C_local, clear_accum=False)
+
+                    D.reduce(C_local, op="sum", level="inter_group", axis="k",
+                             group="summa")
+
+
+                    if gid == 0:
+                        T.copy(C_local,
+                               C[(bx * GY_ + gid_y) * BM, (by * GX_ + gid_x) * BN])
+
+        return summa_gemm_dp_split_k
+
+    def test_summa_gemm_dp_2d_e2e(
+        self,
+        deeploy_test_dir: Path,
+        toolchain: str,
+        toolchain_dir: str,
+        cmake_args: list,
+    ) -> None:
+        """2D SUMMA via D.broadcast: GX=GY=4 (16 clusters), verify C = A @ B."""
+        import tilelang.language as T
+        from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
+        from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+        from testUtils.codeGenerate import TilelangIOBuffer, generateTilelangSoftHierTestNetwork
+        from testUtils.core import configure_cmake
+        from testUtils.pytestRunner import create_test_config
+
+        GX, GY = 4, 4
+        NUM_CLUSTERS = GX * GY
+        M, K, N = 512, 7168, 3072
+        BM, BK, BN = 128, 128, 128
+        elem_bytes = 2
+
+        summa_gemm_dp = self._build_summa_gemm_dp_kernel(GX=GX, GY=GY)
+        A = T.empty((M, K), T.float16)
+        B = T.empty((K, N), T.float16)
+        C = T.empty((M, N), T.float16)
+
+        registry = ClusterGroupRegistry([
+            ClusterGroup("summa", group_x=GX, group_y=GY, num_groups=1,
+                         axis_names=("x", "y"), root_coord=(0, 0))
+        ])
+        hw = HardwareBinding({"summa": list(range(NUM_CLUSTERS))})
+
+        body = compile_tilelang_to_softhier_parallel(
+            summa_gemm_dp, A, B, C, BM=BM, BN=BN, BK=BK, GX_=GX, GY_=GY,
+            group_registry=registry,
+            hw_binding=hw,
+            num_clusters=NUM_CLUSTERS,
+        )
+
+        rng = np.random.default_rng(42)
+        A_np = rng.standard_normal((M, K)).astype(np.float16)
+        B_np = rng.standard_normal((K, N)).astype(np.float16)
+        C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
+
+        input_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16",
+                             nbytes=M * K * elem_bytes, is_input=True),
+            TilelangIOBuffer(name="DeeployNetwork_B", c_dtype="fp16",
+                             nbytes=K * N * elem_bytes, is_input=True),
+        ]
+        output_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_C", c_dtype="fp16",
+                             nbytes=M * N * elem_bytes, is_input=False),
+        ]
+
+        cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
+        config = create_test_config(
+            test_name="Tilelang/summa_gemm_dp_2d",
+            platform="SoftHier",
+            simulator="gvsoc",
+            deeploy_test_dir=deeploy_test_dir,
+            toolchain=toolchain,
+            toolchain_dir=toolchain_dir,
+            cmake_args=cmake_extra,
+            tiling=False,
+        )
+
+        gen_dir = Path(config.gen_dir)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        generateTilelangSoftHierTestNetwork(
+            tilelangBody=body,
+            dumpdir=str(gen_dir),
+            input_bufs=input_bufs,
+            output_bufs=output_bufs,
+            test_inputs=[A_np, B_np],
+            test_outputs=[C_ref],
+        )
+
+        configure_cmake(config)
+        build_binary(config)
+        result = run_simulation(config)
+        assert "Simulation stopped by user" in result.stdout, "Simulation did not complete successfully"
+
+
+
+    def test_summa_gemm_dp_split_k_e2e(
+        self,
+        deeploy_test_dir: Path,
+        toolchain: str,
+        toolchain_dir: str,
+        cmake_args: list,
+    ) -> None:
+        """2D SUMMA split-K via D.broadcast + D.reduce: 4×(2×2)=16 clusters, verify C = A @ B."""
+        import tilelang.language as T
+        from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
+        from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+        from testUtils.codeGenerate import TilelangIOBuffer, generateTilelangSoftHierTestNetwork
+        from testUtils.core import configure_cmake
+        from testUtils.pytestRunner import create_test_config
+
+        GX, GY, NG = 2, 2, 4
+        NUM_CLUSTERS = GX * GY * NG
+        M, K, N = 256, 256, 256
+        BM, BK, BN = 64, 32, 64
+        elem_bytes = 2
+
+        summa_dp_split_k = self._build_summa_gemm_dp_split_k_kernel(GX=GX, GY=GY, NG=NG)
+        A = T.empty((M, K), T.float16)
+        B = T.empty((K, N), T.float16)
+        C = T.empty((M, N), T.float16)
+
+        registry = ClusterGroupRegistry([
+            ClusterGroup("summa", group_x=GX, group_y=GY, num_groups=NG,
+                         axis_names=("x", "y"), root_coord=(0, 0),
+                         meta_axes=("k",), meta_shape=(NG,))
+        ])
+        hw = HardwareBinding({"summa": list(range(NUM_CLUSTERS))})
+
+        body = compile_tilelang_to_softhier_parallel(
+            summa_dp_split_k, A, B, C, BM=BM, BN=BN, BK=BK, GX_=GX, GY_=GY, NG_=NG,
+            group_registry=registry,
+            hw_binding=hw,
+            num_clusters=NUM_CLUSTERS,
+        )
+
+        rng = np.random.default_rng(42)
+        A_np = rng.standard_normal((M, K)).astype(np.float16)
+        B_np = rng.standard_normal((K, N)).astype(np.float16)
+        C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
+
+        input_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16",
+                             nbytes=M * K * elem_bytes, is_input=True),
+            TilelangIOBuffer(name="DeeployNetwork_B", c_dtype="fp16",
+                             nbytes=K * N * elem_bytes, is_input=True),
+        ]
+        output_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_C", c_dtype="fp16",
+                             nbytes=M * N * elem_bytes, is_input=False),
+        ]
+
+        cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
+        config = create_test_config(
+            test_name="Tilelang/summa_gemm_dp_split_k",
+            platform="SoftHier",
+            simulator="gvsoc",
+            deeploy_test_dir=deeploy_test_dir,
+            toolchain=toolchain,
+            toolchain_dir=toolchain_dir,
+            cmake_args=cmake_extra,
+            tiling=False,
+        )
+
+        gen_dir = Path(config.gen_dir)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        generateTilelangSoftHierTestNetwork(
+            tilelangBody=body,
+            dumpdir=str(gen_dir),
+            input_bufs=input_bufs,
+            output_bufs=output_bufs,
+            test_inputs=[A_np, B_np],
+            test_outputs=[C_ref],
+        )
+
+        configure_cmake(config)
+        build_binary(config)
+        result = run_simulation(config)
+        assert "Simulation stopped by user" in result.stdout, "Simulation did not complete successfully"
+

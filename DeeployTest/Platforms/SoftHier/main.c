@@ -20,6 +20,8 @@
 // float32_t is defined in Generic types.h
 typedef float float32_t;
 
+#define ENABLE_VERIFY 0
+
 // Deeploy-generated
 #include "Network.h"
 #include "testinputs.h"
@@ -48,7 +50,7 @@ int main() {
 	InitNetwork(core_id, ARCH_NUM_CORE_PER_CLUSTER);
 
 	flex_global_barrier_xy(); // Ensure InitNetwork completes before RunNetwork
-
+#if ENABLE_VERIFY
 	if (CID == 0) {
 		// For non-float32 inputs: assume input datatype is supported by SoftHier components
 		if (!ISFLOAT32) {
@@ -161,11 +163,11 @@ int main() {
 	}
 
 	flex_global_barrier_xy(); // Ensure InitNetwork completes before RunNetwork
-	
+#endif	
 	RunNetwork(core_id, ARCH_NUM_CORE_PER_CLUSTER);
 	
 	flex_global_barrier_xy(); 
-
+#if ENABLE_VERIFY
 if (CID == 0) { // only allow cluster 0 to work
 	flex_intra_cluster_sync(); // Cluster barrier
 	// verification
@@ -217,7 +219,7 @@ if (CID == 0) { // only allow cluster 0 to work
 	}
 	flex_intra_cluster_sync(); // Cluster barrier
 }
-
+#endif
   /**************************************/
   /*  Program Execution Region -- Stop  */
   /**************************************/

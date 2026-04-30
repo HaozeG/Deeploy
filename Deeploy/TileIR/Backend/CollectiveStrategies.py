@@ -121,6 +121,19 @@ def _row_col_masks(
     )
 
 
+def _inter_group_masks(gid: str) -> tuple:
+    """Return (row_mask, col_mask, edge_flag) for cross-instance (split-K) collectives.
+
+    Inverted masks span corresponding ranks across all group instances.
+    Matches SummaGEMM.h:396-397,480-481 (~wakeup_row_mask / ~wakeup_col_mask).
+    """
+    return (
+        f"(~group_info_{gid}.wakeup_row_mask)",
+        f"(~group_info_{gid}.wakeup_col_mask)",
+        f"cluster_for_rowwise_{gid}",
+    )
+
+
 def _collective_op_kind(reduce_op: str) -> str:
     """Map reduce_op string to SoftHier C enum constant."""
     mapping = {
@@ -557,10 +570,188 @@ class GroupBcastAxis(CollectiveStrategy):
 
 
 # ---------------------------------------------------------------------------
+# Strategy 8: DpReduceStrategy — D.reduce (tl.deeploy.reduce)
+#
+#   Dispatches on spec.level:
+#     "intra_group" — axis-scoped or full-group reduce+broadcast within one
+#                     instance, using row/col masks from the group info.
+#     "inter_group" — cross-instance reduce+broadcast, using inverted masks
+#                     and a global barrier (split-K pattern).
+# ---------------------------------------------------------------------------
+
+class DpReduceStrategy(CollectiveStrategy):
+    """Lower D.reduce() to hardware reduce + broadcast.
+
+    Handles both intra-group (axis/full-group) and inter-group (inverted-mask)
+    cases based on ``spec.level`` and ``spec.axis``.
+    """
+
+    def matches(self, spec, group, topology):
+        return spec.op == "dp_reduce"
+
+    def emit(self, spec, binding, registry) -> List["TileBinding"]:
+        from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
+            TileCollectiveBroadcastTemplate,
+            TileCollectiveReduceTemplate,
+        )
+        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+
+        gid = spec.group_id
+        root_cluster_id = binding.root_cluster_for(gid, registry)
+        op_kind = _collective_op_kind(spec.reduce_op)
+        nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
+
+        if spec.level == "inter_group":
+            row_mask, col_mask, edge_flag = _inter_group_masks(gid)
+            global_barrier = True
+        else:
+            group = registry.get(gid)
+            row_mask, col_mask, edge_flag = _row_col_masks(gid, spec.axis, group)
+            global_barrier = False
+
+        reduce_rep = {
+            "src_name":           spec.src_buffer,
+            "dst_name":           spec.src_buffer,
+            "root_cluster_id":    root_cluster_id,
+            "group_id":           gid,
+            "collective_op_kind": op_kind,
+            "row_mask":           row_mask,
+            "col_mask":           col_mask,
+            "edge_flag":          edge_flag,
+            "global_barrier":     global_barrier,
+            "nbytes":             nbytes_placeholder,
+            "cluster_id":         None,
+            "shard_metadata":     None,
+        }
+        bcast_rep = {
+            "src_name":        spec.src_buffer,
+            "dst_name":        spec.src_buffer,
+            "root_cluster_id": root_cluster_id,
+            "group_id":        gid,
+            "row_mask":        row_mask,
+            "col_mask":        col_mask,
+            "edge_flag":       edge_flag,
+            "global_barrier":  global_barrier,
+            "nbytes":          nbytes_placeholder,
+            "cluster_id":      None,
+            "shard_metadata":  None,
+        }
+
+        return [
+            TileBinding(
+                op_kind="group_collective",
+                template=TileCollectiveReduceTemplate,
+                operator_representation=reduce_rep,
+                op_name=f"tile_dp_reduce_{gid}",
+            ),
+            TileBinding(
+                op_kind="group_collective",
+                template=TileCollectiveBroadcastTemplate,
+                operator_representation=bcast_rep,
+                op_name=f"tile_dp_reduce_bcast_{gid}",
+            ),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Strategy 9: DpBroadcastStrategy — D.broadcast (tl.deeploy.broadcast)
+#
+#   Dispatches on spec.level:
+#     "intra_group" — axis-scoped broadcast within one instance.
+#                     Uses the same GroupBcastAxis pattern: edge cluster is
+#                     the one whose rank along *axis* equals *root_expr*.
+#     "inter_group" — cross-instance broadcast using inverted masks.
+# ---------------------------------------------------------------------------
+
+class DpBroadcastStrategy(CollectiveStrategy):
+    """Lower D.broadcast() to a hardware broadcast.
+
+    Handles both intra-group (axis-scoped, dynamic root) and inter-group
+    (inverted-mask) cases based on ``spec.level`` and ``spec.axis``.
+    """
+
+    def matches(self, spec, group, topology):
+        return spec.op == "dp_broadcast"
+
+    def emit(self, spec, binding, registry) -> List["TileBinding"]:
+        from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
+            TileCollectiveBroadcastTemplate,
+            TileCollectiveGroupBcastAxisTemplate,
+        )
+        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+
+        gid = spec.group_id
+        root_cluster_id = binding.root_cluster_for(gid, registry)
+        nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
+
+        if spec.level == "inter_group":
+            row_mask, col_mask, edge_flag = _inter_group_masks(gid)
+            rep = {
+                "src_name":        spec.src_buffer,
+                "dst_name":        spec.dst_buffer,
+                "root_cluster_id": root_cluster_id,
+                "group_id":        gid,
+                "row_mask":        row_mask,
+                "col_mask":        col_mask,
+                "edge_flag":       edge_flag,
+                "nbytes":          nbytes_placeholder,
+                "cluster_id":      None,
+                "shard_metadata":  None,
+            }
+            return [
+                TileBinding(
+                    op_kind="group_collective",
+                    template=TileCollectiveBroadcastTemplate,
+                    operator_representation=rep,
+                    op_name=f"tile_dp_bcast_inter_{gid}",
+                )
+            ]
+
+        # Intra-group: axis-scoped broadcast.  The root is spec.root_expr
+        # (C-expression string, e.g. "gid_y"), which varies per cluster.
+        # This is identical to the GroupBcastAxis pattern.
+        group = registry.get(gid)
+        row_mask, col_mask, edge_flag = _row_col_masks(gid, spec.axis, group)
+
+        if spec.root_expr:
+            along = spec.axis or group.axis_names[0]
+            if along == group.axis_names[0]:
+                edge_flag = f"(cluster_in_group_id_x_{gid} == ({spec.root_expr}))"
+            else:
+                edge_flag = f"(cluster_in_group_id_y_{gid} == ({spec.root_expr}))"
+
+        axis_idx = group.axis_index(spec.axis) if spec.axis else 0
+        rep = {
+            "src_name":   spec.src_buffer,
+            "dst_name":   spec.dst_buffer,
+            "group_id":   gid,
+            "axis_index": axis_idx,
+            "axis_name":  spec.axis or group.axis_names[0],
+            "from_coord": spec.root_expr if spec.root_expr else "0",
+            "row_mask":   row_mask,
+            "col_mask":   col_mask,
+            "edge_flag":  edge_flag,
+            "nbytes":     nbytes_placeholder,
+            "cluster_id": None,
+            "shard_metadata": None,
+        }
+        return [
+            TileBinding(
+                op_kind="group_collective",
+                template=TileCollectiveGroupBcastAxisTemplate,
+                operator_representation=rep,
+                op_name=f"tile_dp_bcast_intra_{gid}",
+            )
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Priority list — first match wins
 # ---------------------------------------------------------------------------
 
 STRATEGIES: List[Type[CollectiveStrategy]] = [
+    DpReduceStrategy,         # D.reduce  (tl.deeploy.reduce)  — explicit level/axis
+    DpBroadcastStrategy,      # D.broadcast (tl.deeploy.broadcast) — explicit level/axis
     AxisReduceBroadcast,      # allreduce with axis annotation (SUMMA/FlatAttn pattern)
     AxisBroadcast,            # broadcast
     FullGroupReduceBroadcast, # allreduce without axis annotation (legacy fallback)
