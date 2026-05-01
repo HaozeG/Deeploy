@@ -14,7 +14,15 @@ Design rules
 ------------
 * All parameters except *buffer* are keyword-only — no positional ambiguity.
 * ``level`` and ``group`` are always required.
-* ``axis`` is required on ``level="inter_group"`` (no implicit "all instances").
+* ``axis`` on ``level="inter_group"``:
+
+    - 2-D split (``split_axes`` has ≥ 2 entries): axis selects which split
+      dimension to reduce along.  ``split_axes[0]`` → y-direction (row mask);
+      ``split_axes[1]`` → x-direction (col mask).  Useful for staged reductions.
+    - 1-D split (``split_axes`` has 1 entry): ``axis=split_axes[0]`` selects
+      the row direction.
+    - ``axis=None`` → full 2-D inter-group allreduce across all instances.
+
 * ``axis`` is required on ``level="intra_group"`` when the group has two axes.
 * ``root`` is required for ``broadcast``; optional for ``reduce`` (None = allreduce).
 * Validation is performed at call site; axis-name checks against the registry
@@ -183,7 +191,7 @@ def reduce(
 
         * ``level="intra_group"``: one of ``ClusterGroup.axis_names``.
           Required when the group has two axes; omit only for a 1-D group.
-        * ``level="inter_group"``: one of ``ClusterGroup.meta_axes``.
+        * ``level="inter_group"``: one of ``ClusterGroup.split_axes``.
           Always required (no implicit "all instances").
     group : str
         Cluster-group name declared via ``T.cluster_group(...)``.  Required.

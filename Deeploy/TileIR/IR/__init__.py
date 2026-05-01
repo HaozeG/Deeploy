@@ -2,8 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""TileIR IR — cluster group and collective operation primitives."""
+"""TileIR IR — cluster group, collective operation, and binding primitives."""
 
+from Deeploy.TileIR.IR.CollectiveBinding import CollectiveBinding
 from Deeploy.TileIR.IR.CollectivePrimitives import (
     ClusterGroup,
     ClusterGroupRegistry,
@@ -18,9 +19,16 @@ from Deeploy.TileIR.IR.HardwareBinding import (
     Placement,
     SoftHierCollectiveBackend,
 )
-from Deeploy.TileIR.IR.ParallelPasses import (
-    CollectiveBinding,
+from Deeploy.TileIR.IR.TileBinding import (
+    TileBinding,
+    TileOpCategory,
+    TileOpKind,
+)
+# Backward compat: pass classes previously exported from IR/__init__.py
+from Deeploy.TileIR.Passes.CollectiveLowering import (
     CollectiveLoweringPass,
+)
+from Deeploy.TileIR.Passes.Sync import (
     GroupAwareBarrierPass,
 )
 
@@ -35,6 +43,9 @@ __all__ = [
     "Placement",
     "CollectiveBackend",
     "SoftHierCollectiveBackend",
+    "TileBinding",
+    "TileOpKind",
+    "TileOpCategory",
     "CollectiveBinding",
     "CollectiveLoweringPass",
     "GroupAwareBarrierPass",

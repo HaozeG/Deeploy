@@ -107,7 +107,7 @@ from Deeploy.DeeployTypes import (
     NetworkContext,
     NodeTemplate,
 )
-from Deeploy.TileIR.Midend import TileBinding, TileBindingPipeline
+from Deeploy.TileIR.IR.CollectiveBinding import CollectiveBinding
 from Deeploy.TileIR.IR.CollectivePrimitives import (
     ClusterGroupRegistry,
     CollectiveOpSpec,
@@ -115,7 +115,8 @@ from Deeploy.TileIR.IR.CollectivePrimitives import (
     TensorLayout,
     parse_cluster_group_spec,
 )
-from Deeploy.TileIR.IR.ParallelPasses import CollectiveBinding
+from Deeploy.TileIR.IR.TileBinding import TileBinding
+from Deeploy.TileIR.Midend.Pipeline import TileBindingPipeline
 from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
     TileAllocReducerTemplate,
 )
@@ -199,6 +200,15 @@ def _infer_memory_level(buf: "tir.Buffer") -> str:
 class _ExprStringifier:
     """Converts a TVM PrimExpr to a C expression string."""
 
+    def __init__(self):
+        self._let_bindings: Dict[str, str] = {}
+
+    def push_let(self, name: str, value: str):
+        self._let_bindings[name] = value
+
+    def pop_let(self, name: str):
+        self._let_bindings.pop(name, None)
+
     def stringify(self, expr) -> str:
         if expr is None:
             return "0"
@@ -237,7 +247,8 @@ class _ExprStringifier:
         return str(int(expr.value))
 
     def _str_Var(self, expr) -> str:
-        return str(expr.name)
+        name = str(expr.name)
+        return self._let_bindings.get(name, name)
 
     def _str_Call(self, expr) -> str:
         # T.if_then_else → ternary
@@ -847,25 +858,59 @@ class TilelangVisitor:
             if child is not None:
                 self._visit_stmt(child, cluster_id)
 
+    def _visit_LetStmt(self, stmt, cluster_id):
+        """tir.LetStmt: inline the bound variable as a compile-time substitution.
+
+        Variables like ``k_base`` and ``K_per_inst`` are compiler temporaries
+        — their values are composed from SPMD rank variables and compile-time
+        constants, so we inline the expression rather than emitting a C declaration.
+        """
+        var_name = str(stmt.var.name)
+        value_str = _STRINGIFIER.stringify(stmt.value)
+        _STRINGIFIER.push_let(var_name, value_str)
+        self._visit_stmt(stmt.body, cluster_id)
+        _STRINGIFIER.pop_let(var_name)
+
     def _visit_BlockRealize(self, stmt, cluster_id):
         self._visit_stmt(stmt.block, cluster_id)
 
     def _peek_cluster_group(self, stmt) -> Optional[str]:
-        """Scan the top-level AttrStmt chain in *stmt* for a 'cluster_group' annotation.
+        """Recursively scan *stmt* for a cluster_group annotation.
 
-        TileLang places ``T.attr("anno", "cluster_group", ...)`` as an
-        AttrStmt that wraps the Block body.  Since ``alloc_buffers`` in the
-        Block are processed before the body is visited, ``_current_group_id``
-        is not yet set at alloc-emit time.  This helper pre-scans to detect
-        the group so allocs can be tagged correctly.
+        Proactively creates ``self.group_registry`` and registers the group
+        so the preamble decision in ``_visit_Block`` can find it even when
+        ``group_registry`` was not passed by the caller.
+
+        Handles both ``node="anno"`` (legacy TVM convention) and
+        ``node=None`` (current TileLang ``ib_tir.attr(None, ...)`` output),
+        and walks through For/SeqStmt/Block wrappers.
         """
-        node = stmt
-        while node is not None and type(node).__name__ == "AttrStmt":
-            if (hasattr(node, "node") and str(node.node) == "anno"
-                    and hasattr(node, "attr_key")
-                    and str(node.attr_key) == "cluster_group"):
-                return str(node.value).strip('"').strip("'")
-            node = getattr(node, "body", None)
+        if stmt is None:
+            return None
+        cls = type(stmt).__name__
+
+        if cls == "AttrStmt":
+            node_str = str(getattr(stmt, "node", ""))
+            if (node_str in ("anno", "None")
+                    and hasattr(stmt, "attr_key")
+                    and str(stmt.attr_key) == "cluster_group"):
+                spec = str(stmt.value).strip('"').strip("'")
+                if self.group_registry is None:
+                    self.group_registry = ClusterGroupRegistry()
+                return parse_cluster_group_spec(spec, self.group_registry)
+            return self._peek_cluster_group(getattr(stmt, "body", None))
+
+        if cls == "SeqStmt":
+            for s in stmt.seq:
+                result = self._peek_cluster_group(s)
+                if result is not None:
+                    return result
+            return None
+
+        if cls in ("For", "Block", "BlockRealize"):
+            return self._peek_cluster_group(getattr(stmt, "body", None))
+
+        return None
 
     @staticmethod
     def _scan_for_collective_groups(stmt) -> set:
@@ -1931,15 +1976,15 @@ class TilelangVisitor:
                     f"on 2-D group '{group_id}' (axis_names={grp.axis_names!r})"
                 )
         elif level == "inter_group":
-            if require_axis_for_inter and grp.meta_axes and axis is None:
+            if require_axis_for_inter and grp.split_axes and axis is None:
                 raise ValueError(
                     f"{op_name}: axis is required for level='inter_group' "
-                    f"when group '{group_id}' declares meta_axes={grp.meta_axes!r}"
+                    f"when group '{group_id}' declares split_axes={grp.split_axes!r}"
                 )
-            if axis is not None and grp.meta_axes and axis not in grp.meta_axes:
+            if axis is not None and grp.split_axes and axis not in grp.split_axes:
                 raise ValueError(
                     f"{op_name}: axis={axis!r} not in group '{group_id}' "
-                    f"meta_axes={grp.meta_axes!r}"
+                    f"split_axes={grp.split_axes!r}"
                 )
 
     def _handle_dp_reduce(self, args: list, cluster_id):
@@ -1992,6 +2037,9 @@ class TilelangVisitor:
             root_expr=root_arg,
         )
 
+        tvm_buf = self._local_bufs.get(buf_name) or self._global_bufs.get(buf_name)
+        nbytes = _prod(tvm_buf.shape) * _dtype_bytes(str(tvm_buf.dtype)) if tvm_buf is not None else 0
+
         shard_meta = self._make_shard_metadata()
         if shard_meta is None and group_id:
             shard_meta = ShardMetadata(group_id=group_id)
@@ -2000,7 +2048,7 @@ class TilelangVisitor:
             "dst_name":       buf_name,
             "op":             "dp_reduce",
             "group_id":       group_id,
-            "nbytes":         0,
+            "nbytes":         nbytes,
             "cluster_id":     None,
             "shard_metadata": shard_meta,
         }
@@ -2078,6 +2126,9 @@ class TilelangVisitor:
             root_expr=root_arg,
         )
 
+        tvm_buf = self._local_bufs.get(buf_name) or self._global_bufs.get(buf_name)
+        nbytes = _prod(tvm_buf.shape) * _dtype_bytes(str(tvm_buf.dtype)) if tvm_buf is not None else 0
+
         shard_meta = self._make_shard_metadata()
         if shard_meta is None and group_id:
             shard_meta = ShardMetadata(group_id=group_id)
@@ -2086,7 +2137,7 @@ class TilelangVisitor:
             "dst_name":       buf_name,
             "op":             "dp_broadcast",
             "group_id":       group_id,
-            "nbytes":         0,
+            "nbytes":         nbytes,
             "cluster_id":     None,
             "shard_metadata": shard_meta,
         }

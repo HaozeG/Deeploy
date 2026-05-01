@@ -16,6 +16,10 @@ TileGroupContextTemplate
     ``cluster_for_colwise``.  Pattern copied from
     SummaGEMM.h::SummaGEMMAnaylze lines 131-140.
 
+TileGroupMetaContextTemplate
+    Declares per-split-axis rank aliases for each axis in ``split_axes``:
+    ``_group_id_<axis>_<group_id>`` derived from ``this_grid_id``.
+
 TileGroupBarrierTemplate
     Group-scoped barrier (all group members, no cluster/core guard).
 
@@ -57,6 +61,12 @@ TileGroupInitTemplate = NodeTemplate(TileGroupInitTemplateStr)
 TileGroupContextTemplateStr = r"""<%
 _num_groups = context.get('num_groups', 1)
 _hw_mask    = context.get('hw_bitmask', None)
+_split_axes  = context.get('split_axes',  ())
+_split_shape = context.get('split_shape', ())
+import math
+def _prod_tail(shapes, i):
+    tail = shapes[i+1:]
+    return math.prod(tail) if tail else 1
 %>
 // GroupContext: per-cluster rank variables for group '${group_id}'
 // Pattern copied from SummaGEMM.h::SummaGEMMAnaylze lines 131-140 and FlatAttentionUtil.h lines 206-213.
@@ -76,6 +86,12 @@ uint32_t cluster_active_${group_id} = group_info_${group_id}.valid_grid && (grou
 uint32_t _group_id_${group_id}   = group_info_${group_id}.this_grid_id;
 uint32_t _group_id_x_${group_id} = cluster_in_group_id_x_${group_id};
 uint32_t _group_id_y_${group_id} = cluster_in_group_id_y_${group_id};
+% if _split_axes:
+// Split-axis rank aliases for group '${group_id}'
+% for i, (axis_name, shape) in enumerate(zip(_split_axes, _split_shape)):
+uint32_t _group_id_${axis_name}_${group_id} = (group_info_${group_id}.this_grid_id / ${_prod_tail(_split_shape, i)}) % ${shape};
+% endfor
+% endif
     flex_global_barrier_xy();//Global barrier
     GridSyncGroupInfo info = group_info_${group_id};
     for (int cid = 0; cid < ARCH_NUM_CLUSTER; ++cid)
@@ -117,6 +133,28 @@ uint32_t _group_id_y_${group_id} = cluster_in_group_id_y_${group_id};
 """
 
 TileGroupContextTemplate = NodeTemplate(TileGroupContextTemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileGroupMetaContext: meta-axis rank aliases derived from this_grid_id
+# ---------------------------------------------------------------------------
+
+TileGroupMetaContextTemplateStr = r"""<%
+_split_axes  = context.get('split_axes',  ())
+_split_shape = context.get('split_shape', ())
+import math
+def _prod_tail(shapes, i):
+    tail = shapes[i+1:]
+    return math.prod(tail) if tail else 1
+%>
+% if _split_axes:
+// MetaGroupContext: split-axis rank variables for group '${group_id}' (legacy, now folded into GroupContext)
+% for i, (axis_name, shape) in enumerate(zip(_split_axes, _split_shape)):
+uint32_t _group_id_${axis_name}_${group_id} = (group_info_${group_id}.this_grid_id / ${_prod_tail(_split_shape, i)}) % ${shape};
+% endfor
+% endif
+"""
+
+TileGroupMetaContextTemplate = NodeTemplate(TileGroupMetaContextTemplateStr)
 
 # ---------------------------------------------------------------------------
 # TileGroupBarrier

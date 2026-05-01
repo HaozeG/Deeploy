@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         CollectiveOpSpec,
     )
     from Deeploy.TileIR.IR.HardwareBinding import HardwareBinding, HwTopology
-    from Deeploy.TileIR.Midend.TileBindings import TileBinding
+    from Deeploy.TileIR.IR.TileBinding import TileBinding
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +121,45 @@ def _row_col_masks(
     )
 
 
-def _inter_group_masks(gid: str) -> tuple:
-    """Return (row_mask, col_mask, edge_flag) for cross-instance (split-K) collectives.
+def _inter_group_masks(gid: str, axis: str = None, group=None) -> tuple:
+    """Return (row_mask, col_mask, edge_flag) for cross-instance collectives.
 
     Inverted masks span corresponding ranks across all group instances.
     Matches SummaGEMM.h:396-397,480-481 (~wakeup_row_mask / ~wakeup_col_mask).
+
+    Axis-based selection (mirrors _row_col_masks for intra-group) applies when:
+      (a) split is 2-D (len(split_axes) >= 2): each split axis maps cleanly to
+          one physical direction regardless of intra-group shape.
+            split_axes[0] → y-direction → (~wakeup_row_mask, ARCH_NUM_CLUSTER_Y-1)
+            split_axes[1] → x-direction → (ARCH_NUM_CLUSTER_X-1, ~wakeup_col_mask)
+      (b) intra-group is 1-D (group_y == 1): split_axes[0] → row reduction.
+
+    Falls back to full 2-D (both masks inverted) when:
+      - 2-D intra-group + 1-D split (instances span both physical dims; a
+        single axis cannot distinguish direction) — preserves existing behaviour.
+      - axis is None or axis not in split_axes.
     """
+    _is_2d_group = group is not None and group.group_y > 1
+    _is_2d_split = group is not None and len(group.split_axes) >= 2
+    use_axis_based = _is_2d_split or not _is_2d_group
+
+    if use_axis_based and axis is not None and group is not None \
+            and group.split_axes and axis in group.split_axes:
+        idx = group.split_axes.index(axis)
+        if idx == 0:
+            return (
+                f"(~group_info_{gid}.wakeup_row_mask)",
+                "(ARCH_NUM_CLUSTER_Y - 1)",
+                f"(cluster_in_group_id_x_{gid} == 0)",
+            )
+        else:
+            return (
+                "(ARCH_NUM_CLUSTER_X - 1)",
+                f"(~group_info_{gid}.wakeup_col_mask)",
+                f"(cluster_in_group_id_y_{gid} == 0)",
+            )
+
+    # Full 2-D inter-group reduction
     return (
         f"(~group_info_{gid}.wakeup_row_mask)",
         f"(~group_info_{gid}.wakeup_col_mask)",
@@ -180,7 +213,7 @@ class AxisReduceBroadcast(CollectiveStrategy):
             TileCollectiveBroadcastTemplate,
             TileCollectiveReduceTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         group = registry.get(spec.group_id)
         gid = spec.group_id
@@ -265,7 +298,7 @@ class AxisBroadcast(CollectiveStrategy):
         from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
             TileCollectiveBroadcastTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         group = registry.get(spec.group_id)
         gid = spec.group_id
@@ -319,7 +352,7 @@ class FullGroupReduceBroadcast(CollectiveStrategy):
             TileCollectiveBroadcastTemplate,
             TileCollectiveReduceTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         group = registry.get(spec.group_id)
         gid = spec.group_id
@@ -385,7 +418,7 @@ class ScatterStrategy(CollectiveStrategy):
         from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
             TileCollectiveScatterTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         gid = spec.group_id
         root_cluster_id = binding.root_cluster_for(gid, registry)
@@ -430,7 +463,7 @@ class GatherStrategy(CollectiveStrategy):
         from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
             TileCollectiveGatherTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         gid = spec.group_id
         root_cluster_id = binding.root_cluster_for(gid, registry)
@@ -481,7 +514,7 @@ class GroupShift(CollectiveStrategy):
         from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
             TileCollectiveGroupShiftTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         gid = spec.group_id
         group = registry.get(gid)
@@ -528,7 +561,7 @@ class GroupBcastAxis(CollectiveStrategy):
         from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
             TileCollectiveGroupBcastAxisTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         gid = spec.group_id
         group = registry.get(gid)
@@ -594,18 +627,18 @@ class DpReduceStrategy(CollectiveStrategy):
             TileCollectiveBroadcastTemplate,
             TileCollectiveReduceTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         gid = spec.group_id
         root_cluster_id = binding.root_cluster_for(gid, registry)
         op_kind = _collective_op_kind(spec.reduce_op)
         nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
 
+        group = registry.get(gid)
         if spec.level == "inter_group":
-            row_mask, col_mask, edge_flag = _inter_group_masks(gid)
+            row_mask, col_mask, edge_flag = _inter_group_masks(gid, spec.axis, group)
             global_barrier = True
         else:
-            group = registry.get(gid)
             row_mask, col_mask, edge_flag = _row_col_masks(gid, spec.axis, group)
             global_barrier = False
 
@@ -678,14 +711,15 @@ class DpBroadcastStrategy(CollectiveStrategy):
             TileCollectiveBroadcastTemplate,
             TileCollectiveGroupBcastAxisTemplate,
         )
-        from Deeploy.TileIR.Midend.TileBindings import TileBinding
+        from Deeploy.TileIR.IR.TileBinding import TileBinding
 
         gid = spec.group_id
         root_cluster_id = binding.root_cluster_for(gid, registry)
         nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
 
+        group = registry.get(gid)
         if spec.level == "inter_group":
-            row_mask, col_mask, edge_flag = _inter_group_masks(gid)
+            row_mask, col_mask, edge_flag = _inter_group_masks(gid, spec.axis, group)
             rep = {
                 "src_name":        spec.src_buffer,
                 "dst_name":        spec.dst_buffer,
@@ -710,7 +744,6 @@ class DpBroadcastStrategy(CollectiveStrategy):
         # Intra-group: axis-scoped broadcast.  The root is spec.root_expr
         # (C-expression string, e.g. "gid_y"), which varies per cluster.
         # This is identical to the GroupBcastAxis pattern.
-        group = registry.get(gid)
         row_mask, col_mask, edge_flag = _row_col_masks(gid, spec.axis, group)
 
         if spec.root_expr:

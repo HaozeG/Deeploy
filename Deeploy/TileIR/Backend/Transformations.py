@@ -191,6 +191,8 @@ register_tile_op_transformer("alloc", _passthrough_transformer())
 register_tile_op_transformer("free", _passthrough_transformer())
 # block_preamble declares _bid/_cluster_active once per tile block; no guard needed
 register_tile_op_transformer("block_preamble", _passthrough_transformer())
+# group_preamble declares per-group active guard; template embeds own logic
+register_tile_op_transformer("group_preamble", _passthrough_transformer())
 # sync (flex_intra_cluster_sync) must be called by ALL cores in a cluster —
 # wrapping it in a cluster guard would cause a deadlock.
 register_tile_op_transformer("sync", _passthrough_transformer())

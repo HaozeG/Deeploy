@@ -11,11 +11,13 @@ from Deeploy.TileIR.IR import (
     ClusterGroupRegistry,
     CollectiveBinding,
     CollectiveOpSpec,
-    CollectiveLoweringPass,
-    GroupAwareBarrierPass,
     HardwareBinding,
     ShardMetadata,
     SoftHierCollectiveBackend,
+)
+from Deeploy.TileIR.Passes import (
+    CollectiveLoweringPass,
+    GroupAwareBarrierPass,
 )
 
 __all__ = [

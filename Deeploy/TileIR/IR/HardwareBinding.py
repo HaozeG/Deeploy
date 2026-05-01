@@ -21,7 +21,7 @@ if TYPE_CHECKING:
         ClusterGroupRegistry,
         CollectiveOpSpec,
     )
-    from Deeploy.TileIR.Midend.TileBindings import TileBinding
+    from Deeploy.TileIR.IR.TileBinding import TileBinding
 
 
 @dataclass
