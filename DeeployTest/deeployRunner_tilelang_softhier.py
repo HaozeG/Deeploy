@@ -171,15 +171,23 @@ def compile_tilelang_to_softhier_parallel(
     )
     tilebinding = visitor.visit_bindings(primfunc, ctxt)
 
+    # After visiting, use the registry that the visitor populated from the kernel
+    # spec (via T.cluster_group annotations).  When the caller passed group_registry=None,
+    # the visitor auto-creates a ClusterGroupRegistry; we pick it up here so that
+    # the passes below see the full group geometry without requiring a manual registry
+    # in driver code.
+    effective_registry = visitor.group_registry if group_registry is None else group_registry
+
     # Replace default GlobalClusterBarrierPass with group-aware pass;
     # keep SoftwarePipelinePass first to handle T.Pipelined(num_stages=N) loops.
     # Pass group_registry so SoftwarePipelinePass can emit strided K-split loops
     # for multi-cluster TP groups instead of running all K-blocks on every cluster.
-    tilebinding.binding_passes = [SoftwarePipelinePass(group_registry=group_registry), HoistAllocFreePass(), GroupAwareBarrierPass()]
+    from Deeploy.TileIR.Passes.SpatzVectorization import SpatzVectorizationPass
+    tilebinding.binding_passes = [SoftwarePipelinePass(group_registry=effective_registry), HoistAllocFreePass(), SpatzVectorizationPass(), GroupAwareBarrierPass()]
     # Add collective lowering pass
     tilebinding.add_binding_pass(
         CollectiveLoweringPass(
-            registry=group_registry,
+            registry=effective_registry,
             hw_binding=hw_binding,
             backend=backend,
         ))

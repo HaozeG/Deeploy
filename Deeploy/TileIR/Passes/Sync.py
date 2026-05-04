@@ -40,7 +40,13 @@ grid_sync_group_barrier_xy(&group_info_${group_id});
 
 @dataclass
 class GlobalClusterBarrierPass(TileBindingPass):
-    """Insert an unguarded global barrier between cluster_id transitions."""
+    """Insert a global barrier between cluster_id transitions.
+
+    Barriers are skipped when either the source or destination cluster_id is
+    ``None`` (meaning "all clusters"): transitioning between a guarded block
+    and an unguarded block does not require cross-cluster synchronization
+    because each cluster handles the transition independently.
+    """
 
     def apply(self, bindings: List[TileBinding]) -> List[TileBinding]:
         transformed: List[TileBinding] = []
@@ -53,7 +59,10 @@ class GlobalClusterBarrierPass(TileBindingPass):
                 continue
 
             current_cluster_id = binding.operator_representation.get("cluster_id", None)
-            if prev_seen and current_cluster_id != prev_cluster_id:
+            if (prev_seen
+                    and current_cluster_id != prev_cluster_id
+                    and prev_cluster_id is not None
+                    and current_cluster_id is not None):
                 transformed.append(
                     TileBinding(
                         op_kind="sync",

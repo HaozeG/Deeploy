@@ -60,14 +60,20 @@ class TileOpKind(str, enum.Enum):
     else_open = "else_open"
     # --- sync ---
     sync = "sync"
+    global_barrier = "global_barrier"
     # --- collective ---
     group_collective = "group_collective"
     group_barrier = "group_barrier"
     alloc_reducer = "alloc_reducer"
     group_preamble = "group_preamble"
+    intra_cluster_reduce = "intra_cluster_reduce"
     # --- misc ---
     comment = "comment"
     block_preamble = "block_preamble"
+    math_preamble = "math_preamble"
+    runtime_assert = "runtime_assert"
+    runtime_assume = "runtime_assume"
+    cumsum = "cumsum"
 
     @property
     def category(self) -> TileOpCategory:
@@ -95,12 +101,18 @@ _OP_CATEGORY_MAP: Dict[TileOpKind, TileOpCategory] = {
     TileOpKind.if_close: TileOpCategory.CONTROL_FLOW,
     TileOpKind.else_open: TileOpCategory.CONTROL_FLOW,
     TileOpKind.sync: TileOpCategory.SYNC,
+    TileOpKind.global_barrier: TileOpCategory.SYNC,
     TileOpKind.group_collective: TileOpCategory.COLLECTIVE,
     TileOpKind.group_barrier: TileOpCategory.COLLECTIVE,
     TileOpKind.alloc_reducer: TileOpCategory.COLLECTIVE,
+    TileOpKind.intra_cluster_reduce: TileOpCategory.COMPUTE,
     TileOpKind.group_preamble: TileOpCategory.CONTROL_FLOW,
     TileOpKind.comment: TileOpCategory.MISC,
     TileOpKind.block_preamble: TileOpCategory.MISC,
+    TileOpKind.math_preamble: TileOpCategory.MISC,
+    TileOpKind.runtime_assert: TileOpCategory.MISC,
+    TileOpKind.runtime_assume: TileOpCategory.MISC,
+    TileOpKind.cumsum: TileOpCategory.COMPUTE,
 }
 
 # Op kinds that barrier passes should skip (transparent to barrier insertion).

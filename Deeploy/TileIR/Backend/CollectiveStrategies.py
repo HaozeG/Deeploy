@@ -501,11 +501,18 @@ class GatherStrategy(CollectiveStrategy):
 class GroupShift(CollectiveStrategy):
     """Ring-shift a tile by ``spec.shift_by`` along ``spec.reduce_axis``.
 
-    v1 semantics: wrap-around only.  The SoftHier runtime primitive for
-    ring DMA is wired in via ``TileCollectiveGroupShiftTemplate`` (a thin
-    wrapper around ``flex_dma_async_shift`` when available, else a C
-    comment stub for validation of the dispatch plumbing).
+    Uses ``flex_dma_async_pattern_round_shift_{direction}`` DMA primitives.
+    Axis "x" → left/right, axis "y" → up (down not yet available, falls back
+    to up with barrier for ring semantics).
     """
+
+    # Map (axis, direction_sign) → DMA function name
+    _SHIFT_FN_MAP = {
+        ("x",  1): "flex_dma_async_pattern_round_shift_right",
+        ("x", -1): "flex_dma_async_pattern_round_shift_left",
+        ("y", -1): "flex_dma_async_pattern_round_shift_up",
+        ("y",  1): None,  # "down" not available in runtime; barrier-only fallback
+    }
 
     def matches(self, spec, group, topology):
         return spec.op == "shift"
@@ -519,15 +526,21 @@ class GroupShift(CollectiveStrategy):
         gid = spec.group_id
         group = registry.get(gid)
         axis_idx = group.axis_index(spec.reduce_axis) if spec.reduce_axis else 0
+        axis_name = spec.reduce_axis or group.axis_names[0]
         nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
+
+        # Determine DMA shift function
+        shift_dir = 1 if spec.shift_by > 0 else -1
+        shift_fn = self._SHIFT_FN_MAP.get((axis_name, shift_dir))
 
         rep = {
             "src_name":       spec.src_buffer,
             "dst_name":       spec.dst_buffer,
             "group_id":       gid,
             "axis_index":     axis_idx,
-            "axis_name":      spec.reduce_axis or group.axis_names[0],
+            "axis_name":      axis_name,
             "shift_by":       spec.shift_by,
+            "shift_fn":       shift_fn,
             "nbytes":         nbytes_placeholder,
             "cluster_id":     None,
             "shard_metadata": None,

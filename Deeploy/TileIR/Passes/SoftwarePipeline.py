@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from Deeploy.DeeployTypes import NodeTemplate
 from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import TileGroupBarrierTemplate
+from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import TileSyncTemplate
 from Deeploy.TileIR.IR.CollectiveBinding import CollectiveBinding
 from Deeploy.TileIR.IR.TileBinding import TileBinding, TileOpKind
 from Deeploy.TileIR.Passes.Base import (
@@ -397,46 +398,53 @@ class SoftwarePipelinePass(TileBindingPass):
             rank_var = f"cluster_in_group_id_x_{tp_group_id}"
             tp_start_expr = f"{rank_var} * {tiles_per_rank}"
             tp_end_expr   = f"({rank_var} + 1) * {tiles_per_rank}"
-            prologue_subst = tp_start_expr
         else:
             tiles_per_rank = None
             tp_start_expr  = None
             tp_end_expr    = None
-            prologue_subst = "0"
 
-        # ---- Prologue: load stage 0 + disseminate (cluster-specific K offset) ----
-        for lb in load_bindings:
-            orig_dst = lb.operator_representation["dst"]
-            rep = dict(lb.operator_representation)
-            rep["dst"] = f"{orig_dst}_0"
-            rep["src_offset"] = self._subst_loop_var(
-                rep.get("src_offset", 0), loop_var, prologue_subst)
-            cond = _load_condition.get(id(lb))
-            if cond:
-                result.append(TileBinding(op_kind="if_open", template=IfOpenTemplate,
-                                          operator_representation={"condition": cond,
-                                                                    "cluster_id": None}))
-            result.append(TileBinding(op_kind="load", template=lb.template,
-                                      operator_representation=rep))
-            if cond:
-                result.append(TileBinding(op_kind="if_close", template=IfCloseTemplate,
-                                          operator_representation={"cluster_id": None}))
-        # Emit COMM (bcast/shift) for stage 0 so the prologue tile is fully
-        # disseminated to all clusters before the loop starts.
+        # ---- Prologue: prime N-1 stages (bk=0 through bk=N-2) ----
+        # For N=2 (double-buffering) this loads exactly stage _0 — identical
+        # to the old single-stage prologue.  For N>=3 it loads enough stages
+        # so the loop's prefetch target is valid from iteration 0.
         comm_group_id: Optional[str] = phases.comms[0].spec.group_id if phases.comms else None
-        for cb in phases.comms:
-            orig_buf = cb.spec.src_buffer
-            rep = dict(cb.operator_representation)
-            rep["src_name"] = f"{orig_buf}_0"
-            rep["dst_name"] = f"{orig_buf}_0"
-            result.append(CollectiveBinding(
-                op_kind="group_collective",
-                template=cb.template,
-                operator_representation=rep,
-                spec=cb.spec,
-                op_name=cb.op_name,
-            ))
-        # After prologue bcast, align DM and compute cores within each cluster.
+        prologue_num_stages = num_stages - 1
+        for s in range(prologue_num_stages):
+            if s >= extent:
+                break  # extent smaller than prologue size (pathological)
+            if tp_group_id:
+                stage_subst = str(tp_start_expr) if s == 0 else f"({tp_start_expr} + {s})"
+            else:
+                stage_subst = str(s)
+            for lb in load_bindings:
+                orig_dst = lb.operator_representation["dst"]
+                rep = dict(lb.operator_representation)
+                rep["dst"] = f"{orig_dst}_{s}"
+                rep["src_offset"] = self._subst_loop_var(
+                    rep.get("src_offset", 0), loop_var, stage_subst)
+                cond = _load_condition.get(id(lb))
+                if cond:
+                    result.append(TileBinding(op_kind="if_open", template=IfOpenTemplate,
+                                              operator_representation={"condition": cond,
+                                                                        "cluster_id": None}))
+                result.append(TileBinding(op_kind="load", template=lb.template,
+                                          operator_representation=rep))
+                if cond:
+                    result.append(TileBinding(op_kind="if_close", template=IfCloseTemplate,
+                                              operator_representation={"cluster_id": None}))
+            for cb in phases.comms:
+                orig_buf = cb.spec.src_buffer
+                rep = dict(cb.operator_representation)
+                rep["src_name"] = f"{orig_buf}_{s}"
+                rep["dst_name"] = f"{orig_buf}_{s}"
+                result.append(CollectiveBinding(
+                    op_kind="group_collective",
+                    template=cb.template,
+                    operator_representation=rep,
+                    spec=cb.spec,
+                    op_name=cb.op_name,
+                ))
+        # After prologue loads and bcasts, align DM and compute cores.
         result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
                                   operator_representation={"cluster_id": None}))
 
@@ -498,14 +506,14 @@ class SoftwarePipelinePass(TileBindingPass):
                         f"[({loop_var} - {tp_start_expr}) % {num_stages}];")
                     stage_lines.append(
                         f"{dtype}* {orig_dst}_nxt = {orig_dst}_stages"
-                        f"[({loop_var} - {tp_start_expr} + 1) % {num_stages}];")
+                        f"[({loop_var} - {tp_start_expr} + {num_stages - 1}) % {num_stages}];")
                 else:
                     stage_lines.append(
                         f"{dtype}* {orig_dst}_cur = {orig_dst}_stages"
                         f"[{loop_var} % {num_stages}];")
                     stage_lines.append(
                         f"{dtype}* {orig_dst}_nxt = {orig_dst}_stages"
-                        f"[({loop_var} + 1) % {num_stages}];")
+                        f"[({loop_var} + {num_stages - 1}) % {num_stages}];")
         stage_select_source = "\n".join(stage_lines) + "\n"
         result.append(TileBinding(
             op_kind="comment",
@@ -513,8 +521,8 @@ class SoftwarePipelinePass(TileBindingPass):
             operator_representation={"cluster_id": None},
         ))
 
-        # ---- Prefetch loads (DM core): load next stage, guarded ----
-        next_bk_expr = f"{loop_var} + 1"
+        # ---- Prefetch loads (DM core): load stage N-1 steps ahead, guarded ----
+        next_bk_expr = f"{loop_var} + {num_stages - 1}"
         guard_expr = f"{next_bk_expr} < {tp_end_expr}" if tp_group_id else f"{next_bk_expr} < {extent}"
         for lb in load_bindings:
             orig_dst = lb.operator_representation["dst"]
@@ -567,6 +575,7 @@ class SoftwarePipelinePass(TileBindingPass):
         # ---- Main loop body: compute bindings in original order ----
         _pipelined_scope_kinds = {"pipelined_for_open", "pipelined_for_close"}
         _skip_ids = {id(b) for b in phases.comms + phases.follow_syncs + phases.empty_conditionals}
+        _compute_start = len(result)
         for b in inner:
             if b.op_kind == "load" and b.operator_representation.get("dst") in load_buf_names:
                 continue  # promoted to prefetch stage above
@@ -597,6 +606,18 @@ class SoftwarePipelinePass(TileBindingPass):
                 result.append(TileBinding(op_kind=b.op_kind, template=b.template,
                                           operator_representation=rep))
 
+        # Strip trailing intra-cluster syncs from the compute body.
+        # For COMM pipelines the loop-top group-barrier + sync provides
+        # inter-iteration synchronization; for non-COMM pipelines the
+        # trailing sync emitted below serves the same purpose.
+        _intra_sync_templates = {_INTRA_CLUSTER_SYNC_TEMPLATE, TileSyncTemplate}
+        while len(result) > _compute_start:
+            _last = result[-1]
+            if _last.op_kind == "sync" and _last.template in _intra_sync_templates:
+                result.pop()
+            else:
+                break
+
         # ---- Trailing sync (non-COMM pipelines only) ----
         if not comm_group_id:
             result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
@@ -605,5 +626,14 @@ class SoftwarePipelinePass(TileBindingPass):
         # ---- Main loop close ----
         result.append(TileBinding(op_kind="for_close", template=ForLoopCloseTemplate,
                                   operator_representation={"loop_var": loop_var}))
+
+        # ---- Post-loop sync (COMM pipelines) ----
+        # For COMM pipelines the loop-top barrier synchronizes iterations
+        # but the *last* iteration has no next barrier.  Without this sync
+        # the DM core's TileStore can read the GEMM output buffer before
+        # the compute core (flex_is_first_core) has finished writing.
+        if comm_group_id:
+            result.append(TileBinding(op_kind="sync", template=_INTRA_CLUSTER_SYNC_TEMPLATE,
+                                      operator_representation={"cluster_id": None}))
 
         return result, close_idx + 1

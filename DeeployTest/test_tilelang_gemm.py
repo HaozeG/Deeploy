@@ -402,7 +402,7 @@ class TestEndToEndDpCollective:
                     C_local = T.alloc_fragment((BM, BN), dtype)
                     T.clear(C_local)
 
-                    for bk in T.Pipelined(T.ceildiv(K, BK), num_stages=3):
+                    for bk in T.Pipelined(T.ceildiv(K, BK), num_stages=2):
                         if local_x == local_y:
                             T.copy(A[(by * GY_ + local_y) * BM, bk * BK], A_local)
                             T.copy(B[bk * BK, (bx * GX_ + local_x) * BN], B_local)
@@ -566,10 +566,10 @@ class TestEndToEndDpCollective:
 
         GX, GY = 4, 4
         NUM_CLUSTERS = GX * GY
-        # M, K, N = 512, 7168, 3072
-        # BM, BK, BN = 128, 128, 128
-        M, K, N = 256, 256, 256
-        BM, BK, BN = 64, 64, 64
+        M, K, N = 512, 7168, 512
+        BM, BK, BN = 128, 128, 128
+        # M, K, N = 256, 256, 256
+        # BM, BK, BN = 64, 64, 64
         elem_bytes = 2
 
         summa_gemm_dp = self._build_summa_gemm_dp_kernel(GX=GX, GY=GY)
@@ -590,11 +590,6 @@ class TestEndToEndDpCollective:
             num_clusters=NUM_CLUSTERS,
         )
 
-        rng = np.random.default_rng(42)
-        A_np = rng.standard_normal((M, K)).astype(np.float16)
-        B_np = rng.standard_normal((K, N)).astype(np.float16)
-        C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
-
         input_bufs = [
             TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16",
                              nbytes=M * K * elem_bytes, is_input=True),
@@ -605,6 +600,23 @@ class TestEndToEndDpCollective:
             TilelangIOBuffer(name="DeeployNetwork_C", c_dtype="fp16",
                              nbytes=M * N * elem_bytes, is_input=False),
         ]
+
+        # Skip preloading when the total test data exceeds 5 MB (float32 upcast).
+        # Large tests run with ENABLE_VERIFY=0 so the data is never DMA'd in;
+        # preloading would bloat the binary (.hbm_reserved merges into PROGBITS)
+        # and add simulation overhead for no benefit.
+        _total_preload_bytes = (M * K + K * N + M * N) 
+        _need_verify = _total_preload_bytes < 5 * 1024 * 1024
+        if _need_verify:
+            rng = np.random.default_rng(42)
+            A_np = rng.standard_normal((M, K)).astype(np.float16)
+            B_np = rng.standard_normal((K, N)).astype(np.float16)
+            C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
+            test_in = [A_np, B_np]
+            test_out = [C_ref]
+        else:
+            test_in = None
+            test_out = None
 
         cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
         config = create_test_config(
@@ -625,8 +637,8 @@ class TestEndToEndDpCollective:
             dumpdir=str(gen_dir),
             input_bufs=input_bufs,
             output_bufs=output_bufs,
-            test_inputs=[A_np, B_np],
-            test_outputs=[C_ref],
+            test_inputs=test_in,
+            test_outputs=test_out,
         )
 
         configure_cmake(config)

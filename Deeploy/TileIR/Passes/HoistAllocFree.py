@@ -56,8 +56,16 @@ class HoistAllocFreePass(TileBindingPass):
 
         for b in bindings[outer_open_idx:outer_close_idx + 1]:
             if b.op_kind == "alloc":
+                # Clear cluster_id so the alloc runs on all clusters without
+                # referencing the now-out-of-scope loop variable (e.g. bx).
+                rep = dict(b.operator_representation)
+                rep["cluster_id"] = None
+                b.operator_representation = rep
                 hoisted_allocs.append(b)
             elif b.op_kind == "free":
+                rep = dict(b.operator_representation)
+                rep["cluster_id"] = None
+                b.operator_representation = rep
                 hoisted_frees.append(b)
             else:
                 loop_body.append(b)

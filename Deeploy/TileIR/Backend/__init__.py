@@ -16,6 +16,10 @@ from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
     TileSyncTemplate,
     TileAllocTemplate,
     TileFreeTemplate,
+    TileMathPreambleTemplate,
+    TileAssertTemplate,
+    TileGlobalBarrierTemplate,
+    TileIntraClusterReduceTemplate,
 )
 from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
     TileGroupInitTemplate,
@@ -43,6 +47,10 @@ __all__ = [
     "TileSyncTemplate",
     "TileAllocTemplate",
     "TileFreeTemplate",
+    "TileMathPreambleTemplate",
+    "TileAssertTemplate",
+    "TileGlobalBarrierTemplate",
+    "TileIntraClusterReduceTemplate",
     "TileGroupInitTemplate",
     "TileGroupBarrierTemplate",
     "TileAllocReducerTemplate",

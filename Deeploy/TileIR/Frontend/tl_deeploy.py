@@ -68,7 +68,14 @@ try:
     from tilelang.utils.language import get_buffer_region_from_load, to_buffer_region
 
     # Register Deeploy ops in the TVM op registry (idempotent after first import).
-    for _op_name in ("tl.deeploy.reduce", "tl.deeploy.broadcast"):
+    for _op_name in (
+        "tl.deeploy.reduce",
+        "tl.deeploy.broadcast",
+        "tl.deeploy.sync_grid",
+        "tl.deeploy.thread_return",
+        "tl.deeploy.device_assert",
+        "tl.deeploy.assume",
+    ):
         try:
             tvm.ir.Op.get(_op_name)
         except Exception:
@@ -249,4 +256,72 @@ def broadcast(
         tir.StringImm(axis or ""),
         tir.StringImm(group),
         tir.StringImm(_root_to_str(root)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Control-flow / runtime intrinsics
+# ---------------------------------------------------------------------------
+
+def sync_grid() -> "tir.PrimExpr":
+    """Mid-kernel global barrier across all clusters.
+
+    Emits ``flex_global_barrier_xy()`` in generated C.  All clusters must
+    reach this point before any proceeds.
+    """
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.deeploy.sync_grid"),
+    )
+
+
+def thread_return() -> "tir.PrimExpr":
+    """Early return from the current cluster's kernel block.
+
+    Emits ``return;`` inside the cluster guard, allowing a cluster to exit
+    the kernel early (e.g. when its work partition is empty).
+    """
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.deeploy.thread_return"),
+    )
+
+
+def device_assert(condition: Union[bool, "tir.PrimExpr"], message: str = "") -> "tir.PrimExpr":
+    """Runtime assertion that prints *message* and aborts on failure.
+
+    Parameters
+    ----------
+    condition : bool | tir.PrimExpr
+        Condition that must be true at runtime.
+    message : str
+        Optional message printed on assertion failure.
+    """
+    cond_str = str(condition)
+    try:
+        cond_str = str(int(condition))
+    except (TypeError, ValueError):
+        pass
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.deeploy.device_assert"),
+        tir.StringImm(cond_str),
+        tir.StringImm(message),
+    )
+
+
+def assume(condition: Union[bool, "tir.PrimExpr"]) -> "tir.PrimExpr":
+    """Compiler hint that *condition* is always true at this point.
+
+    Emits ``__builtin_assume(condition)`` in generated C.
+    """
+    cond_str = str(condition)
+    try:
+        cond_str = str(int(condition))
+    except (TypeError, ValueError):
+        pass
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.deeploy.assume"),
+        tir.StringImm(cond_str),
     )

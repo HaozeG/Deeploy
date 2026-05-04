@@ -202,6 +202,12 @@ class _ExprStringifier:
 
     def __init__(self):
         self._let_bindings: Dict[str, str] = {}
+        self._used_math: set = set()  # track which math intrinsics were used
+        self._buffer_rename: Dict[str, str] = {}  # TIR name → mangled C name
+
+    def set_buffer_rename(self, tir_name: str, c_name: str):
+        """Register a mapping from TIR buffer name to mangled C name."""
+        self._buffer_rename[tir_name] = c_name
 
     def push_let(self, name: str, value: str):
         self._let_bindings[name] = value
@@ -221,8 +227,24 @@ class _ExprStringifier:
 
     def _str_BufferLoad(self, expr) -> str:
         buf = expr.buffer.name
-        indices = ", ".join(self.stringify(i) for i in expr.indices)
-        return f"((fp16*){buf})[{indices}]"
+        mangled = self._buffer_rename.get(buf, buf)
+        if len(expr.indices) <= 1:
+            idx = self.stringify(expr.indices[0]) if expr.indices else "0"
+            return f"((fp16*){mangled})[{idx}]"
+        # Multi-dim → linearized flat index: i*stride + j
+        shape = [int(d) for d in expr.buffer.shape]
+        # build (i0*s1*s2*... + i1*s2*... + ... + iN)
+        terms = []
+        for d, idx_expr in enumerate(expr.indices):
+            stride = 1
+            for s in shape[d + 1:]:
+                stride *= s
+            idx_str = self.stringify(idx_expr)
+            if stride == 1:
+                terms.append(idx_str)
+            else:
+                terms.append(f"({idx_str} * {stride})")
+        return f"((fp16*){mangled})[{' + '.join(terms)}]"
 
     def _str_Add(self, expr) -> str:
         return f"({self.stringify(expr.a)} + {self.stringify(expr.b)})"
@@ -235,6 +257,20 @@ class _ExprStringifier:
 
     def _str_Div(self, expr) -> str:
         return f"({self.stringify(expr.a)} / {self.stringify(expr.b)})"
+
+    def _str_FloorDiv(self, expr) -> str:
+        return f"({self.stringify(expr.a)} / {self.stringify(expr.b)})"
+
+    def _str_FloorMod(self, expr) -> str:
+        return f"({self.stringify(expr.a)} % {self.stringify(expr.b)})"
+
+    def _str_Max(self, expr) -> str:
+        self._used_math.add("max")
+        return f"tile_fp16_max({self.stringify(expr.a)}, {self.stringify(expr.b)})"
+
+    def _str_Min(self, expr) -> str:
+        self._used_math.add("max")  # reuses tile_fp16_min which shares max style
+        return f"tile_fp16_min({self.stringify(expr.a)}, {self.stringify(expr.b)})"
 
     def _str_Cast(self, expr) -> str:
         c_type = _c_dtype(str(expr.dtype))
@@ -256,6 +292,24 @@ class _ExprStringifier:
         if "if_then_else" in op_name:
             cond, t, f = [self.stringify(a) for a in expr.args]
             return f"(({cond}) ? {t} : {f})"
+
+        # Math intrinsics: map TileLang names to SoftHier helper macros.
+        # Only fp16 types are supported by SoftHier hardware.
+        _math_suffix_map = {
+            "exp":      "tile_fp16_exp",
+            "sigmoid":  "tile_fp16_sigmoid",
+            "sqrt":     "tile_fp16_sqrt",
+            "rsqrt":    "tile_fp16_rsqrt",
+            "abs":      "tile_fp16_abs",
+            "max":      "tile_fp16_max",
+            "relu":     "tile_fp16_relu",
+        }
+        for suffix, macro_name in _math_suffix_map.items():
+            if suffix in op_name:
+                self._used_math.add(suffix)
+                args_str = ", ".join(self.stringify(a) for a in expr.args)
+                return f"{macro_name}({args_str})"
+
         # Fallback
         args = ", ".join(self.stringify(a) for a in expr.args)
         return f"{op_name}({args})"
@@ -400,10 +454,21 @@ class TilelangVisitor:
             "group_shift": self._handle_group_shift,
             "group_bcast_axis": self._handle_group_bcast_axis,
             "alloc_reducer": self._handle_alloc_reducer_intrinsic,
+            # T.Select: handled at expression level by ExprStringifier;
+            # registered here to avoid "unhandled intrinsic" warning.
+            "Select": self._handle_select_intrinsic,
             # tl.deeploy.* ops: keyed by full name to avoid collision with
             # tl.tileop.reduce (element-wise TVM reduce) and tl.tileop.broadcast.
             "tl.deeploy.reduce": self._handle_dp_reduce,
             "tl.deeploy.broadcast": self._handle_dp_broadcast,
+            # P0/P1 control-flow / runtime intrinsics (D.* namespace)
+            "tl.deeploy.sync_grid": self._handle_sync_grid,
+            "tl.deeploy.thread_return": self._handle_thread_return,
+            "tl.deeploy.device_assert": self._handle_device_assert,
+            "tl.deeploy.assume": self._handle_assume,
+            # sync_threads maps to intra-cluster barrier (needed for
+            # cooperative L1 staging patterns, e.g. tiled transpose).
+            "sync_threads": self._handle_sync_threads,
         }
 
     # ------------------------------------------------------------------
@@ -465,8 +530,27 @@ class TilelangVisitor:
         # 2. Register PrimFunc parameters as HBM buffers
         self._register_params(primfunc)
 
-        # 3. Walk the body
+        # 3. Reset math tracking for this PrimFunc
+        _STRINGIFIER._used_math.clear()
+
+        # 4. Walk the body
         self._visit_stmt(primfunc.body, cluster_id=None)
+
+        # 5. Emit math preamble if any math intrinsics were used
+        if _STRINGIFIER._used_math:
+            from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
+                TileMathPreambleTemplate,
+            )
+            math_binding = TileBinding(
+                op_kind="math_preamble",
+                template=TileMathPreambleTemplate,
+                operator_representation={
+                    "cluster_id": None,
+                    "shard_metadata": None,
+                },
+                op_name="tile_math_preamble",
+            )
+            self._bindings.bindings.insert(0, math_binding)
 
         return self._bindings
 
@@ -803,6 +887,9 @@ class TilelangVisitor:
             if param in primfunc.buffer_map:
                 buf = primfunc.buffer_map[param]
                 self._global_bufs[buf.name] = buf
+                # Register TIR → mangled C name mapping for ExprStringifier
+                if self._ctxt is not None:
+                    _STRINGIFIER.set_buffer_rename(buf.name, self._ctxt._mangle(buf.name))
                 # Register in context (global = HBM)
                 try:
                     from Deeploy.Targets.SoftHier.Platform import SoftHierDynamicBuffer
@@ -823,6 +910,9 @@ class TilelangVisitor:
         """Register an alloc_fragment buffer as an L1 DynamicBuffer."""
         self._local_bufs[buf.name] = buf
         self._alloc_order.append(buf.name)
+        # Register TIR → mangled C name mapping for ExprStringifier
+        if self._ctxt is not None:
+            _STRINGIFIER.set_buffer_rename(buf.name, self._ctxt._mangle(buf.name))
         try:
             from Deeploy.Targets.SoftHier.Platform import SoftHierDynamicBuffer
             nbytes = _prod(buf.shape) * _dtype_bytes(str(buf.dtype))
@@ -1566,7 +1656,11 @@ class TilelangVisitor:
 
     def _handle_parallel_for(self, stmt, loop_var: str, extent: int, cluster_id):
         # TODO: consider using vector unit by SIMD ops
-        """Parallel For with a BufferStore body → TileEltwise."""
+        """Parallel For with BufferStore body → TileEltwise.
+
+        Supports single BufferStore and SeqStmt of multiple BufferStores
+        (fused element-wise kernels with multiple outputs).
+        """
         body = stmt.body
         # Unwrap nested parallel For loops
         while type(body).__name__ == "For" and int(body.kind) == 1:
@@ -1575,30 +1669,60 @@ class TilelangVisitor:
             inner_extent   = int(body.extent)
             body = inner_body
 
-        if type(body).__name__ == "BufferStore":
-            dst_name  = body.buffer.name
-            src_expr  = _STRINGIFIER.stringify(body.value)
+        def _emit_one_parallel_store(store_stmt):
+            """Emit a single TileEltwiseTemplate from a BufferStore."""
+            dst_name  = store_stmt.buffer.name
+            src_expr  = _STRINGIFIER.stringify(store_stmt.value)
             buf       = (self._local_bufs.get(dst_name) or
                          self._global_bufs.get(dst_name))
             dtype     = _c_dtype(str(buf.dtype)) if buf else "fp16"
-            resolved_cluster_id, op_metadata = self._op_metadata(
+            resolved_cid, op_meta = self._op_metadata(
                 cluster_id,
                 dst_buffers=[dst_name],
             )
+            idx_expr = self._linearize_indices(store_stmt)
             rep = {
                 "dst":        dst_name,
                 "src_expr":   src_expr,
                 "loop_var":   loop_var,
+                "index_expr": idx_expr,
                 "extent":     extent,
                 "dtype":      dtype,
-                "cluster_id": resolved_cluster_id,
-                "metadata":   op_metadata,
+                "cluster_id": resolved_cid,
+                "metadata":   op_meta,
             }
             self._emit_binding("eltwise", TileEltwiseTemplate, rep)
+            return resolved_cid
+
+        body_cls = type(body).__name__
+
+        if body_cls == "BufferStore":
+            resolved_cid = _emit_one_parallel_store(body)
             self._emit_binding("sync", TileSyncTemplate, {
-                "cluster_id": resolved_cluster_id,
-                "metadata": op_metadata,
+                "cluster_id": resolved_cid,
+                "metadata": self._op_metadata(cluster_id)[1],
             })
+        elif body_cls == "SeqStmt":
+            stores = list(body.seq)
+            if stores and all(type(s).__name__ == "BufferStore" for s in stores):
+                last_cid = cluster_id
+                for s in stores:
+                    last_cid = _emit_one_parallel_store(s)
+                self._emit_binding("sync", TileSyncTemplate, {
+                    "cluster_id": last_cid,
+                    "metadata": self._op_metadata(cluster_id)[1],
+                })
+            else:
+                # SeqStmt with non-BufferStore content — fall back to serial
+                rep_open = {
+                    "loop_var":   loop_var,
+                    "min_val":    0,
+                    "extent":     extent,
+                    "cluster_id": None,
+                }
+                self._emit_binding("for_open", ForLoopOpenTemplate, rep_open)
+                self._visit_stmt(stmt.body, cluster_id)
+                self._emit_binding("for_close", ForLoopCloseTemplate, {"loop_var": loop_var})
         else:
             # Fallback: emit a serial loop
             rep_open = {
@@ -1611,8 +1735,34 @@ class TilelangVisitor:
             self._visit_stmt(stmt.body, cluster_id)
             self._emit_binding("for_close", ForLoopCloseTemplate, {"loop_var": loop_var})
 
+    @staticmethod
+    def _linearize_indices(stmt) -> str:
+        """Linearize multi-dim BufferStore indices to a flat C array index string.
+
+        For a buffer with shape [M, N], indices [i, j] become "i * N + j".
+        For single-index stores, returns the stringified index directly.
+        """
+        indices = list(stmt.indices)
+        if len(indices) <= 1:
+            return _STRINGIFIER.stringify(indices[0]) if indices else "0"
+        shape = [int(d) for d in stmt.buffer.shape]
+        terms = []
+        for d, idx_expr in enumerate(indices):
+            stride = 1
+            for s in shape[d + 1:]:
+                stride *= s
+            idx_str = _STRINGIFIER.stringify(idx_expr)
+            if stride == 1:
+                terms.append(idx_str)
+            else:
+                terms.append(f"({idx_str} * {stride})")
+        return " + ".join(terms)
+
     def _visit_BufferStore(self, stmt, cluster_id):
-        """Scalar BufferStore outside a parallel loop — emit as TileEltwise(extent=1)."""
+        """BufferStore outside a parallel loop — emit as TileEltwise(extent=1).
+
+        Multi-dim indices are linearized to a flat C array index.
+        """
         dst_name = stmt.buffer.name
         src_expr = _STRINGIFIER.stringify(stmt.value)
         buf      = (self._local_bufs.get(dst_name) or
@@ -1622,12 +1772,14 @@ class TilelangVisitor:
             cluster_id,
             dst_buffers=[dst_name],
         )
-        # Use a constant 0 index for simplicity
         loop_var = "_i_scalar"
+        # Compute linearized index for the store destination
+        index_expr = self._linearize_indices(stmt)
         rep = {
             "dst":        dst_name,
             "src_expr":   src_expr,
             "loop_var":   loop_var,
+            "index_expr": index_expr,
             "extent":     1,
             "dtype":      dtype,
             "cluster_id": resolved_cluster_id,
@@ -1918,6 +2070,93 @@ class TilelangVisitor:
             )
             self._bindings.bindings[-1] = cb
 
+    # ------------------------------------------------------------------
+    # P0/P1 handlers: sync_grid, select, thread_return, device_assert, assume
+    # ------------------------------------------------------------------
+
+    def _handle_sync_grid(self, args: list, cluster_id):
+        """T.sync_grid() → global barrier (flex_global_barrier_xy)."""
+        from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
+            TileGlobalBarrierTemplate,
+        )
+        resolved_cluster_id, op_metadata = self._op_metadata(cluster_id)
+        self._emit_binding("global_barrier", TileGlobalBarrierTemplate, {
+            "cluster_id": resolved_cluster_id,
+            "metadata": op_metadata,
+        })
+
+    def _handle_select_intrinsic(self, args: list, cluster_id):
+        """T.Select(cond, true_val, false_val) — handled as an eltwise expression.
+
+        The actual ternary is generated by _ExprStringifier._str_Call when
+        it encounters an if_then_else Call.  This handler exists so
+        T.Select does not produce an "unhandled intrinsic" warning.
+        It is a no-op: the surrounding BufferStore or assignment will
+        stringify the RHS expression, which includes the Select/if_then_else.
+        """
+        pass
+
+    def _handle_sync_threads(self, args: list, cluster_id):
+        """T.sync_threads() → intra-cluster barrier (flex_intra_cluster_sync)."""
+        from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
+            TileSyncTemplate,
+        )
+        resolved_cluster_id, op_metadata = self._op_metadata(cluster_id)
+        self._emit_binding("sync", TileSyncTemplate, {
+            "cluster_id": resolved_cluster_id,
+            "metadata": op_metadata,
+        })
+
+    def _handle_thread_return(self, args: list, cluster_id):
+        """T.thread_return() → early return from the cluster-guarded block."""
+        resolved_cluster_id, op_metadata = self._op_metadata(cluster_id)
+        # Emit a standalone return statement; the cluster guard (if present)
+        # wraps it so only the target cluster exits.
+        self._emit_binding(
+            "comment",
+            NodeTemplate("return;\n"),
+            {
+                "cluster_id": resolved_cluster_id,
+                "metadata": op_metadata,
+            },
+        )
+
+    def _handle_device_assert(self, args: list, cluster_id):
+        """T.device_assert(cond, message) → runtime assertion."""
+        from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
+            TileAssertTemplate,
+        )
+        if len(args) < 1:
+            return
+        condition = _STRINGIFIER.stringify(args[0]) if len(args) > 0 else "0"
+        message = str(args[1]).strip('"') if len(args) > 1 else "assertion failed"
+        resolved_cluster_id, op_metadata = self._op_metadata(cluster_id)
+        self._emit_binding("runtime_assert", TileAssertTemplate, {
+            "condition": condition,
+            "message": message,
+            "cluster_id": resolved_cluster_id,
+            "metadata": op_metadata,
+        })
+
+    def _handle_assume(self, args: list, cluster_id):
+        """T.assume(cond) → compiler hint (__builtin_assume)."""
+        if len(args) < 1:
+            return
+        condition = _STRINGIFIER.stringify(args[0])
+        resolved_cluster_id, op_metadata = self._op_metadata(cluster_id)
+        self._emit_binding(
+            "runtime_assume",
+            NodeTemplate(f"__builtin_assume({condition});\n"),
+            {
+                "cluster_id": resolved_cluster_id,
+                "metadata": op_metadata,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # alloc_reducer intrinsic
+    # ------------------------------------------------------------------
+
     def _handle_alloc_reducer_intrinsic(self, args: list, cluster_id):
         """T.alloc_reducer(buf_name_or_region, dtype, nbytes) → alloc_reducer binding.
 
@@ -2162,7 +2401,6 @@ class TilelangVisitor:
 
     # ------------------------------------------------------------------
     # Region helpers
-    # TODO: Consider extension here, as it carrys tile information
     # ------------------------------------------------------------------
 
     def _region_buf_name(self, region) -> str:

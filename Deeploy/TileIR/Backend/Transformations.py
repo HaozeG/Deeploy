@@ -196,6 +196,17 @@ register_tile_op_transformer("group_preamble", _passthrough_transformer())
 # sync (flex_intra_cluster_sync) must be called by ALL cores in a cluster —
 # wrapping it in a cluster guard would cause a deadlock.
 register_tile_op_transformer("sync", _passthrough_transformer())
+# global_barrier (flex_global_barrier_xy) is a full-chip sync — no guard.
+register_tile_op_transformer("global_barrier", _passthrough_transformer())
+# intra_cluster_reduce embeds its own core-dispatch logic; no guard needed.
+register_tile_op_transformer("intra_cluster_reduce", _passthrough_transformer())
 # pipelined for-loop open/close brackets: no cluster guard needed
 register_tile_op_transformer("pipelined_for_open", _passthrough_transformer())
 register_tile_op_transformer("pipelined_for_close", _passthrough_transformer())
+# math_preamble — emitted once; passthrough
+register_tile_op_transformer("math_preamble", _passthrough_transformer())
+# runtime_assert / runtime_assume — guards already handled by surrounding context
+register_tile_op_transformer("runtime_assert", _default_tile_op_transformer())
+register_tile_op_transformer("runtime_assume", _passthrough_transformer())
+# cumsum — sequential L1 loop, uses cluster guard
+register_tile_op_transformer("cumsum", _default_tile_op_transformer())

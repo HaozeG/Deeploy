@@ -5,6 +5,7 @@
 import dataclasses
 import os
 import shutil
+import subprocess
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -323,6 +324,132 @@ def _tilelang_numpy_dtype_to_ctype(dtype: np.dtype) -> str:
     raise ValueError(f"Unsupported TileLang vector dtype for C header generation: {dtype}")
 
 
+_HBM_START_BASE = 0xC0000000
+_HBM_ALIGNMENT = 64
+# Offset preloaded data past the main ELF's .data and .hbm sections (which start
+# at HBM_BASE).  Without this the ELF loader overwrites preloaded values with the
+# .hbm section's PROGBITS contents.
+_PRELOAD_HBM_OFFSET = 0x100000
+
+
+def _compute_preload_addresses(arrays: Sequence[np.ndarray]) -> List[int]:
+    """Compute HBM addresses for preloading arrays, returning one address per array."""
+    addrs = []
+    next_addr = _HBM_START_BASE + _PRELOAD_HBM_OFFSET
+    for arr in arrays:
+        flat = np.asarray(arr)
+        # Match the upcast convention: fp16 arrays are written as float32 in binary
+        elem_size = 4 if flat.dtype == np.float16 else flat.dtype.itemsize
+        nbytes = flat.size * elem_size
+        next_addr = (next_addr + _HBM_ALIGNMENT - 1) & ~(_HBM_ALIGNMENT - 1)
+        addrs.append(next_addr)
+        next_addr += nbytes
+    return addrs
+
+
+def _resolve_toolchain_prefix() -> str:
+    """Resolve the riscv32 toolchain prefix from env or PATH."""
+    # Check explicit toolchain env vars first
+    for env_var in ("TOOLCHAIN_INSTALL_DIR", "LLVM_INSTALL_DIR"):
+        toolchain_dir = os.environ.get(env_var, "")
+        if toolchain_dir:
+            prefix = os.path.join(toolchain_dir, "bin", "riscv32-unknown-elf")
+            if os.path.isfile(f"{prefix}-gcc"):
+                return prefix
+    # Check SOFTHIER_INSTALL_DIR for the bundled toolchain
+    softhier_dir = os.environ.get("SOFTHIER_INSTALL_DIR", "")
+    if softhier_dir:
+        prefix = os.path.join(softhier_dir, "third_party", "toolchain", "install", "bin",
+                              "riscv32-unknown-elf")
+        if os.path.isfile(f"{prefix}-gcc"):
+            return prefix
+    # Fallback: search PATH
+    gcc_path = shutil.which("riscv32-unknown-elf-gcc")
+    if gcc_path:
+        return gcc_path[:-4]  # strip "-gcc" suffix
+    return "riscv32-unknown-elf"  # last resort
+
+
+def _write_preload_elf(all_arrays: Sequence[np.ndarray],
+                       output_elf_path: str,
+                       toolchain_prefix: Optional[str] = None) -> Optional[List[int]]:
+    """Generate a preload ELF from numpy arrays, placed at computed HBM addresses.
+
+    Writes each array as a raw binary file (with fp16 -> float32 upcast), converts to
+    ELF objects via objcopy (bypassing the C compiler), and links them at fixed HBM
+    addresses. Returns the list of assigned addresses, or None if there are no arrays.
+    """
+    if toolchain_prefix is None:
+        toolchain_prefix = _resolve_toolchain_prefix()
+
+    if not all_arrays:
+        return None
+
+    addrs = _compute_preload_addresses(all_arrays)
+
+    obj_files = []
+    bin_files = []
+    try:
+        for i, (arr, addr) in enumerate(zip(all_arrays, addrs)):
+            flat = np.asarray(arr)
+            if flat.dtype == np.float16:
+                data = flat.astype(np.float32)
+            else:
+                data = flat
+
+            bin_path = f"{output_elf_path}.{i}.bin"
+            obj_path = f"{output_elf_path}.{i}.o"
+            data.tofile(bin_path)
+            bin_files.append(bin_path)
+
+            subprocess.run(
+                [f"{toolchain_prefix}-objcopy", "-I", "binary", "-O", "elf32-littleriscv",
+                 "-B", "riscv", bin_path, obj_path],
+                check=True, capture_output=True)
+            obj_files.append(obj_path)
+
+        # Linker script: place each object's .data section at its assigned address
+        ld_path = f"{output_elf_path}.ld"
+        with open(ld_path, "w") as f:
+            f.write("SECTIONS {\n")
+            for i, (obj, addr) in enumerate(zip(obj_files, addrs)):
+                f.write(f"    . = 0x{addr:X};\n")
+                f.write(f"    .section_{i} : {{ {obj}(.data) }}\n")
+            f.write("}\n")
+
+        subprocess.run(
+            [f"{toolchain_prefix}-ld", "-T", ld_path] + obj_files + ["-o", output_elf_path],
+            check=True, capture_output=True)
+
+        # Strip non-essential sections (mirrors preload.py convention)
+        subprocess.run(
+            [f"{toolchain_prefix}-strip", "--remove-section=.comment",
+             "--remove-section=.Pulp_Chip.Info", output_elf_path],
+            check=True, capture_output=True)
+
+        return addrs
+    finally:
+        for path in bin_files + obj_files:
+            if os.path.exists(path):
+                os.remove(path)
+        ld_path = f"{output_elf_path}.ld"
+        if os.path.exists(ld_path):
+            os.remove(ld_path)
+
+
+def _generate_tilelang_preload_header(var_prefix: str, addrs: Sequence[int]) -> str:
+    """Generate a header that defines a pointer table to preloaded HBM addresses."""
+    if not addrs:
+        return f"void* {var_prefix}Vector[0] = {{}};\n"
+
+    lines = []
+    for i, addr in enumerate(addrs):
+        lines.append(f"#define {var_prefix.upper()}_{i}_ADDR ((uint64_t)0x{addr:X})")
+    ptrs = ", ".join(f"(void*)(uintptr_t)0x{addr:X}" for addr in addrs)
+    lines.append(f"void* {var_prefix}Vector[{len(addrs)}] = {{{ptrs}}};")
+    return "\n".join(lines) + "\n"
+
+
 def _generate_tilelang_vectors_header(var_prefix: str, arrays: Sequence[np.ndarray]) -> str:
     if not arrays:
         return f"void* {var_prefix}Vector[0] = {{}};\n"
@@ -590,16 +717,50 @@ def generateTilelangSoftHierTestNetwork(
     with open(f"{dumpdir}/Network.c", "w", encoding = "utf-8") as f:
         f.write(networkImpl)
 
-    input_header = _generate_tilelang_vectors_header("testInput", list(test_inputs or []))
+    # Collect all arrays for preload address computation (inputs first, then outputs)
+    inp_list = list(test_inputs or [])
+    out_list = list(test_outputs or [])
+    all_arrays = inp_list + out_list
+    n_inputs = len(inp_list)
+
+    # Generate preload ELF and get HBM addresses for each array
+    preload_elf_path = f"{dumpdir}/preload.elf"
+    all_addrs = _write_preload_elf(all_arrays, preload_elf_path)
+    if all_addrs is None:
+        all_addrs = []
+        # Remove stale preload files from a previous run (when test switches from
+        # preloading to no-preloading).
+        for _stale in (preload_elf_path,
+                       f"{dumpdir}/preload_reserve.S",
+                       f"{dumpdir}/preload_heap_start.txt"):
+            if os.path.exists(_stale):
+                os.remove(_stale)
+    input_addrs = all_addrs[:n_inputs]
+    output_addrs = all_addrs[n_inputs:]
+
+    # Write the heap-start address so CMake can define __hbm_heap_start past the
+    # preloaded region via --defsym.  This avoids putting a .hbm_reserved NOBITS
+    # section in the main ELF whose PROGBITS zero-fill would overwrite the
+    # preloaded data.
+    if all_arrays:
+        last_arr = all_arrays[-1]
+        flat = np.asarray(last_arr)
+        elem_bytes = 4 if flat.dtype == np.float16 else flat.dtype.itemsize
+        heap_start = all_addrs[-1] + flat.size * elem_bytes
+        heap_start = (heap_start + 1023) & ~1023  # align 1024
+        with open(f"{dumpdir}/preload_heap_start.txt", "w") as f:
+            f.write(f"0x{heap_start:X}\n")
+
+    input_header = _generate_tilelang_preload_header("testInput", input_addrs)
     with open(f"{dumpdir}/testinputs.h", "w", encoding = "utf-8") as f:
         f.write(input_header)
 
-    # Generate testoutputs.h with OUTPUTTYPE macros if output_bufs provided
-    if output_bufs is not None:
-        out_dtype = output_bufs[0].c_dtype if output_bufs else "fp16"
-        output_header = _generate_tilelang_outputs_header(list(test_outputs or []), c_dtype = out_dtype)
-    else:
-        output_header = _generate_tilelang_vectors_header("testOutput", list(test_outputs or []))
+    # Generate testoutputs.h with OUTPUTTYPE macros and address-based pointer table
+    out_dtype = output_bufs[0].c_dtype if output_bufs else "fp16"
+    macros = "#define OUTPUTTYPE {}\n".format(out_dtype)
+    macros += "#define ISFLOAT32 1\n"
+    macros += "#define ISOUTPUTFLOAT 0\n"
+    output_header = macros + _generate_tilelang_preload_header("testOutput", output_addrs)
     with open(f"{dumpdir}/testoutputs.h", "w", encoding = "utf-8") as f:
         f.write(output_header)
 

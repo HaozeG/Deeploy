@@ -263,12 +263,57 @@ TileEltwiseTemplateStr = r"""
 {
     uint32_t core_id = flex_get_core_id();
     for (uint32_t ${loop_var} = core_id; ${loop_var} < ${extent}; ${loop_var} += ARCH_NUM_CORE_PER_CLUSTER) {
-        ((${dtype}*)${dst})[${loop_var}] = (${dtype})(${src_expr});
+        ((${dtype}*)${dst})[${index_expr}] = (${dtype})(${src_expr});
     }
 }
 """
 
 TileEltwiseTemplate = NodeTemplate(TileEltwiseTemplateStr)
+
+
+SpatzEltwiseTemplateStr = r"""
+// SpatzEltwise: vectorized ${spatz_op} on ${dst} (${extent} elements, ${num_spatz} Spatz cores)
+{
+    // Read Spatz config via volatile pointer to prevent GCC from
+    // auto-vectorizing the array init (which would clobber v8/v16
+    // before our inline asm uses them).
+    volatile uint32_t _spatz_check[ARCH_NUM_CORE_PER_CLUSTER];
+    do {
+        const uint32_t _tmp[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_CHECK_LIST;
+        for (uint32_t _i = 0; _i < ARCH_NUM_CORE_PER_CLUSTER; _i++)
+            _spatz_check[_i] = _tmp[_i];
+    } while (0);
+    uint32_t _spatz_attached = _spatz_check[flex_get_core_id()];
+    if (_spatz_attached) {
+        volatile uint32_t _spatz_sids[ARCH_NUM_CORE_PER_CLUSTER];
+        do {
+            const uint32_t _tmp[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_SID_LIST;
+            for (uint32_t _i = 0; _i < ARCH_NUM_CORE_PER_CLUSTER; _i++)
+                _spatz_sids[_i] = _tmp[_i];
+        } while (0);
+        uint32_t _spatz_sid = _spatz_sids[flex_get_core_id()];
+        uint32_t _vlen = ${extent} / ARCH_SPATZ_ATTACED_CORES;
+        uint32_t _addr = (uint32_t)(uintptr_t)${dst} + _spatz_sid * _vlen * sizeof(${dtype});
+        ${spatz_setup}
+        uint32_t _avl;
+        while (_vlen > 0) {
+            asm volatile("vsetvli %0, %1, e16, m8, ta, ma" : "=r"(_avl) : "r"(_vlen));
+            ${spatz_body}
+            _vlen -= _avl;
+            _addr += _avl * sizeof(${dtype});
+        }
+    } else {
+        // Scalar fallback — same as TileEltwiseTemplate
+        uint32_t core_id = flex_get_core_id();
+        for (uint32_t ${loop_var} = core_id; ${loop_var} < ${extent}; ${loop_var} += ARCH_NUM_CORE_PER_CLUSTER) {
+            ((${dtype}*)${dst})[${loop_var}] = (${dtype})(${fallback_expr});
+        }
+    }
+}
+"""
+
+SpatzEltwiseTemplate = NodeTemplate(SpatzEltwiseTemplateStr)
+
 
 # ---------------------------------------------------------------------------
 # ForLoop open / close — serial for-loop brace wrappers.
@@ -327,6 +372,85 @@ flex_intra_cluster_sync();
 """
 
 TileSyncTemplate = NodeTemplate(TileSyncTemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileMathPreamble — fp16 math helper macros emitted once when math intrinsics
+# (exp, sigmoid, sqrt, rsqrt, abs, max, relu) are used in eltwise expressions.
+# ---------------------------------------------------------------------------
+
+TileMathPreambleTemplateStr = r"""
+// TileLang math helpers (fp16)
+#define tile_fp16_abs(x) ((fp16)((x) & 0x7FFF))
+#define tile_fp16_relu(x) ({ fp16 _x=(x); (fp16_to_float(_x) > 0.0f) ? _x : ((fp16)0); })
+#define tile_fp16_max(a,b) ({ fp16 _a=(a); fp16 _b=(b); (fp16_to_float(_a) > fp16_to_float(_b)) ? _a : _b; })
+#define tile_fp16_min(a,b) ({ fp16 _a=(a); fp16 _b=(b); (fp16_to_float(_a) < fp16_to_float(_b)) ? _a : _b; })
+#define tile_fp16_exp(x) ({ fp16 _in=(x); fp16 _out; asm_fp16_exp(&_in, &_out); _out; })
+#define tile_fp16_sigmoid(x) ({ fp16 _in=(x); fp16 _out; asm_fp16_sigmoid(&_in, &_out); _out; })
+#define tile_fp16_sqrt(x) ({ float _f=fp16_to_float(x); float _r; __asm__ __volatile__("fsqrt.s %0, %1, rne" : "=f"(_r) : "f"(_f)); float_to_fp16(_r); })
+#define tile_fp16_rsqrt(x) ({ float _f=fp16_to_float(x); float _r; __asm__ __volatile__("fsqrt.s %0, %1, rne" : "=f"(_r) : "f"(_f)); float_to_fp16(1.0f / _r); })
+"""
+
+TileMathPreambleTemplate = NodeTemplate(TileMathPreambleTemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileAssert — runtime assertion from T.device_assert(cond).
+# ---------------------------------------------------------------------------
+
+TileAssertTemplateStr = r"""
+if (!(${condition})) {
+    printf("[TileLang] Assertion failed: ${message}\n");
+}
+"""
+
+TileAssertTemplate = NodeTemplate(TileAssertTemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileGlobalBarrier — explicit mid-kernel global barrier from T.sync_grid().
+# ---------------------------------------------------------------------------
+
+TileGlobalBarrierTemplateStr = r"""
+flex_global_barrier_xy();
+"""
+
+TileGlobalBarrierTemplate = NodeTemplate(TileGlobalBarrierTemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileIntraClusterReduce — reduce across Spatz vector cores within a cluster
+# using shared L1 + cluster barrier (no DMA).  SoftHier analogue of GPU
+# warp_reduce_sum / warp_reduce_max.
+#
+# OperatorRepresentation keys:
+#   buf      : str  — L1 buffer name (in/out)
+#   op       : str  — "sum" | "max" | "min"
+#   nbytes   : int  — buffer size in bytes
+#   dtype    : str  — C element type, e.g. "fp16"
+# ---------------------------------------------------------------------------
+
+TileIntraClusterReduceTemplateStr = r"""
+// TileIntraClusterReduce: ${op} across cores on ${buf} (${nbytes} bytes)
+{
+    uint32_t _core_id = flex_get_core_id();
+    uint32_t _n_elems = ${nbytes} / sizeof(${dtype});
+    if (_core_id == 0) {
+        for (uint32_t _c = 1; _c < ARCH_NUM_CORE_PER_CLUSTER; _c++) {
+            ${dtype} *_src = ((${dtype}*)${buf}) + _c * _n_elems;
+            ${dtype} *_dst = (${dtype}*)${buf};
+            for (uint32_t _i = 0; _i < _n_elems; _i++) {
+                % if op == "sum":
+                _dst[_i] += _src[_i];
+                % elif op == "max":
+                if (_src[_i] > _dst[_i]) _dst[_i] = _src[_i];
+                % elif op == "min":
+                if (_src[_i] < _dst[_i]) _dst[_i] = _src[_i];
+                % endif
+            }
+        }
+    }
+}
+flex_intra_cluster_sync();
+"""
+
+TileIntraClusterReduceTemplate = NodeTemplate(TileIntraClusterReduceTemplateStr)
 
 # ---------------------------------------------------------------------------
 # TileAlloc — L1 scratch buffer allocation (generated by the visitor for each

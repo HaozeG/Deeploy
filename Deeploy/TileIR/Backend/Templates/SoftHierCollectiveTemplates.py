@@ -73,8 +73,6 @@ def _prod_tail(shapes, i):
 FlexPosition _pos_${group_id} = get_pos(flex_get_cluster_id());
 uint32_t cluster_in_group_id_x_${group_id} = (group_info_${group_id}.valid_grid) ? (_pos_${group_id}.x % group_info_${group_id}.grid_x_dim) : 0;
 uint32_t cluster_in_group_id_y_${group_id} = (group_info_${group_id}.valid_grid) ? (_pos_${group_id}.y % group_info_${group_id}.grid_y_dim) : 0;
-uint32_t cluster_for_rowwise_${group_id} = (group_info_${group_id}.valid_grid) && ((cluster_in_group_id_x_${group_id} % group_info_${group_id}.grid_y_dim) == (cluster_in_group_id_y_${group_id} % group_info_${group_id}.grid_x_dim)) && (cluster_in_group_id_x_${group_id} == (_pos_${group_id}.y % group_info_${group_id}.grid_x_dim));
-uint32_t cluster_for_colwise_${group_id} = (group_info_${group_id}.valid_grid) && ((cluster_in_group_id_x_${group_id} % group_info_${group_id}.grid_y_dim) == (cluster_in_group_id_y_${group_id} % group_info_${group_id}.grid_x_dim)) && (cluster_in_group_id_y_${group_id} == (_pos_${group_id}.x % group_info_${group_id}.grid_y_dim));
 ## cluster_active: prefer compile-time hw_bitmask (same idiom as DP bitmask dispatch)
 ## when hw_bitmask is None fall back to topology-driven this_grid_id < N guard.
 % if _hw_mask is not None:
@@ -92,44 +90,47 @@ uint32_t _group_id_y_${group_id} = cluster_in_group_id_y_${group_id};
 uint32_t _group_id_${axis_name}_${group_id} = (group_info_${group_id}.this_grid_id / ${_prod_tail(_split_shape, i)}) % ${shape};
 % endfor
 % endif
-    flex_global_barrier_xy();//Global barrier
-    GridSyncGroupInfo info = group_info_${group_id};
-    for (int cid = 0; cid < ARCH_NUM_CLUSTER; ++cid)
+"""
+
+TileGroupContextPrintStr = r"""
+flex_global_barrier_xy();//Global barrier
+GridSyncGroupInfo info = group_info_${group_id};
+for (int cid = 0; cid < ARCH_NUM_CLUSTER; ++cid)
+{
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == cid)
     {
-        if (flex_get_core_id() == 0 && flex_get_cluster_id() == cid)
-        {
-            printf("[Cluster %3d] All Info: \n", cid);
-            printf("-- valid_grid = %0d \n", info.valid_grid);
-            printf("-- grid_x_dim = %0d \n", info.grid_x_dim);
-            printf("-- grid_y_dim = %0d \n", info.grid_y_dim);
-            printf("-- grid_x_num = %0d \n", info.grid_x_num);
-            printf("-- grid_y_num = %0d \n", info.grid_y_num);
-            printf("-- this_grid_id = %0d \n", info.this_grid_id);
-            printf("-- this_grid_id_x = %0d \n", info.this_grid_id_x);
-            printf("-- this_grid_id_y = %0d \n", info.this_grid_id_y);
-            printf("-- this_grid_left_most = %0d \n", info.this_grid_left_most);
-            printf("-- this_grid_right_most = %0d \n", info.this_grid_right_most);
-            printf("-- this_grid_top_most = %0d \n", info.this_grid_top_most);
-            printf("-- this_grid_bottom_most = %0d \n", info.this_grid_bottom_most);
-            printf("-- this_grid_cluster_num = %0d \n", info.this_grid_cluster_num);
-            printf("-- this_grid_cluster_num_x = %0d \n", info.this_grid_cluster_num_x);
-            printf("-- this_grid_cluster_num_y = %0d \n", info.this_grid_cluster_num_y);
-            printf("-- wakeup_row_mask = 0x%0x \n", info.wakeup_row_mask);
-            printf("-- wakeup_col_mask = 0x%0x \n", info.wakeup_col_mask);
-            printf("-- sync_x_cluster = %0d \n", info.sync_x_cluster);
-            printf("-- sync_y_cluster = %0d \n", info.sync_y_cluster);
-            printf("-- sync_x_point = 0x%0x \n", (uint32_t)info.sync_x_point);
-            printf("-- sync_x_piter = 0x%0x \n", (uint32_t)info.sync_x_piter);
-            printf("-- sync_y_point = 0x%0x \n", (uint32_t)info.sync_y_point);
-            printf("-- sync_y_piter = 0x%0x \n", (uint32_t)info.sync_y_piter);
-            printf("-- cluster_in_group_id_x = %0d \n", cluster_in_group_id_x_${group_id});
-            printf("-- cluster_in_group_id_y = %0d \n", cluster_in_group_id_y_${group_id});
-            printf("-- cluster_for_rowwise = %0d \n", cluster_for_rowwise_${group_id});
-            printf("-- cluster_for_colwise = %0d \n", cluster_for_colwise_${group_id});
-        }
-        flex_global_barrier_xy();//Global barrier
+        printf("[Cluster %3d] All Info: \n", cid);
+        printf("-- valid_grid = %0d \n", info.valid_grid);
+        printf("-- grid_x_dim = %0d \n", info.grid_x_dim);
+        printf("-- grid_y_dim = %0d \n", info.grid_y_dim);
+        printf("-- grid_x_num = %0d \n", info.grid_x_num);
+        printf("-- grid_y_num = %0d \n", info.grid_y_num);
+        printf("-- this_grid_id = %0d \n", info.this_grid_id);
+        printf("-- this_grid_id_x = %0d \n", info.this_grid_id_x);
+        printf("-- this_grid_id_y = %0d \n", info.this_grid_id_y);
+        printf("-- this_grid_left_most = %0d \n", info.this_grid_left_most);
+        printf("-- this_grid_right_most = %0d \n", info.this_grid_right_most);
+        printf("-- this_grid_top_most = %0d \n", info.this_grid_top_most);
+        printf("-- this_grid_bottom_most = %0d \n", info.this_grid_bottom_most);
+        printf("-- this_grid_cluster_num = %0d \n", info.this_grid_cluster_num);
+        printf("-- this_grid_cluster_num_x = %0d \n", info.this_grid_cluster_num_x);
+        printf("-- this_grid_cluster_num_y = %0d \n", info.this_grid_cluster_num_y);
+        printf("-- wakeup_row_mask = 0x%0x \n", info.wakeup_row_mask);
+        printf("-- wakeup_col_mask = 0x%0x \n", info.wakeup_col_mask);
+        printf("-- sync_x_cluster = %0d \n", info.sync_x_cluster);
+        printf("-- sync_y_cluster = %0d \n", info.sync_y_cluster);
+        printf("-- sync_x_point = 0x%0x \n", (uint32_t)info.sync_x_point);
+        printf("-- sync_x_piter = 0x%0x \n", (uint32_t)info.sync_x_piter);
+        printf("-- sync_y_point = 0x%0x \n", (uint32_t)info.sync_y_point);
+        printf("-- sync_y_piter = 0x%0x \n", (uint32_t)info.sync_y_piter);
+        printf("-- cluster_in_group_id_x = %0d \n", cluster_in_group_id_x_${group_id});
+        printf("-- cluster_in_group_id_y = %0d \n", cluster_in_group_id_y_${group_id});
+        printf("-- cluster_for_rowwise = %0d \n", cluster_for_rowwise_${group_id});
+        printf("-- cluster_for_colwise = %0d \n", cluster_for_colwise_${group_id});
     }
     flex_global_barrier_xy();//Global barrier
+}
+flex_global_barrier_xy();//Global barrier
 """
 
 TileGroupContextTemplate = NodeTemplate(TileGroupContextTemplateStr)
@@ -348,10 +349,17 @@ TileCollectiveGatherTemplate = NodeTemplate(TileCollectiveGatherTemplateStr)
 
 TileCollectiveGroupShiftTemplateStr = r"""
 // GroupShift: rotate ${src_name} along group '${group_id}' axis='${axis_name}' by ${shift_by}
-// TODO(softhier-runtime): replace with flex_dma_async_shift once available.
-// Cluster-local no-op placeholder so the dispatch pipeline stays correct.
-(void)${src_name};
-grid_sync_group_barrier_xy(&group_info_${group_id});
+{
+    uint32_t _local_off  = (uint32_t)(uintptr_t)${src_name};
+    uint32_t _remote_off = (uint32_t)(uintptr_t)${src_name};  // same base, DMA engine routes to neighbour
+    size_t   _size       = ${nbytes};
+    % if shift_fn:
+    if (flex_is_dm_core()) {
+        ${shift_fn}(_local_off, _remote_off, _size);
+    }
+    % endif
+    grid_sync_group_barrier_xy(&group_info_${group_id});
+}
 """
 
 TileCollectiveGroupShiftTemplate = NodeTemplate(TileCollectiveGroupShiftTemplateStr)

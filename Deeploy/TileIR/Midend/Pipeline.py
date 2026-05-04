@@ -19,6 +19,7 @@ from Deeploy.TileIR.IR.TileBinding import TileBinding
 from Deeploy.TileIR.Passes.Base import TileBindingPass
 from Deeploy.TileIR.Passes.HoistAllocFree import HoistAllocFreePass
 from Deeploy.TileIR.Passes.SoftwarePipeline import SoftwarePipelinePass
+from Deeploy.TileIR.Passes.SpatzVectorization import SpatzVectorizationPass
 from Deeploy.TileIR.Passes.Sync import DedupSyncPass, GlobalClusterBarrierPass
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ class TileBindingPipeline:
             self.binding_passes = [
                 SoftwarePipelinePass(group_registry=self.group_registry),
                 HoistAllocFreePass(),
+                SpatzVectorizationPass(),
                 GlobalClusterBarrierPass(),
                 DedupSyncPass(),
             ]
