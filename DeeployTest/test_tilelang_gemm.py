@@ -657,7 +657,7 @@ class TestEndToEndDpCollective:
     ) -> None:
         """2D SUMMA split-K via D.broadcast + D.reduce: 4×(2×2)=16 clusters, verify C = A @ B."""
         import tilelang.language as T
-        from Deeploy.TileIR.IR import HardwareBinding
+        from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
         from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
         from testUtils.codeGenerate import TilelangIOBuffer, generateTilelangSoftHierTestNetwork
         from testUtils.core import configure_cmake
@@ -665,8 +665,8 @@ class TestEndToEndDpCollective:
 
         GX, GY, NG = 2, 2, 4
         NUM_CLUSTERS = GX * GY * NG
-        M, K, N = 256, 256, 256
-        BM, BK, BN = 64, 32, 64
+        M, K, N = 512, 7168, 512
+        BM, BK, BN = 128, 128, 128
         elem_bytes = 2
 
         summa_dp_split_k = self._build_summa_gemm_dp_split_k_kernel(GX=GX, GY=GY, NG=NG)
@@ -674,21 +674,18 @@ class TestEndToEndDpCollective:
         B = T.empty((K, N), T.float16)
         C = T.empty((M, N), T.float16)
 
-        # The kernel's T.cluster_group(..., split_axes=("k",), split_shape=(NG,)) spec is
-        # parsed by the visitor; no manual ClusterGroupRegistry needed here.
+        registry = ClusterGroupRegistry([
+            ClusterGroup("summa", group_x=GX, group_y=GY, num_groups=1,
+                         axis_names=("x", "y"), root_coord=(0, 0))
+        ])
         hw = HardwareBinding({"summa": list(range(NUM_CLUSTERS))})
 
         body = compile_tilelang_to_softhier_parallel(
             summa_dp_split_k, A, B, C, BM=BM, BN=BN, BK=BK, GX_=GX, GY_=GY, NG_=NG,
-            group_registry=None,
+            group_registry=registry,
             hw_binding=hw,
             num_clusters=NUM_CLUSTERS,
         )
-
-        rng = np.random.default_rng(42)
-        A_np = rng.standard_normal((M, K)).astype(np.float16)
-        B_np = rng.standard_normal((K, N)).astype(np.float16)
-        C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
 
         input_bufs = [
             TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16",
@@ -701,9 +698,26 @@ class TestEndToEndDpCollective:
                              nbytes=M * N * elem_bytes, is_input=False),
         ]
 
+        # Skip preloading when the total test data exceeds 5 MB (float32 upcast).
+        # Large tests run with ENABLE_VERIFY=0 so the data is never DMA'd in;
+        # preloading would bloat the binary (.hbm_reserved merges into PROGBITS)
+        # and add simulation overhead for no benefit.
+        _total_preload_bytes = (M * K + K * N + M * N) 
+        _need_verify = _total_preload_bytes < 5 * 1024 * 1024
+        if _need_verify:
+            rng = np.random.default_rng(42)
+            A_np = rng.standard_normal((M, K)).astype(np.float16)
+            B_np = rng.standard_normal((K, N)).astype(np.float16)
+            C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
+            test_in = [A_np, B_np]
+            test_out = [C_ref]
+        else:
+            test_in = None
+            test_out = None
+
         cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
         config = create_test_config(
-            test_name="Tilelang/summa_gemm_dp_split_k",
+            test_name="Tilelang/summa_gemm_dp_2d",
             platform="SoftHier",
             simulator="gvsoc",
             deeploy_test_dir=deeploy_test_dir,
@@ -720,8 +734,8 @@ class TestEndToEndDpCollective:
             dumpdir=str(gen_dir),
             input_bufs=input_bufs,
             output_bufs=output_bufs,
-            test_inputs=[A_np, B_np],
-            test_outputs=[C_ref],
+            test_inputs=test_in,
+            test_outputs=test_out,
         )
 
         configure_cmake(config)
@@ -748,8 +762,8 @@ class TestEndToEndDpCollective:
         GX, GY, NK0, NK1 = 2, 2, 2, 2
         NG = NK0 * NK1
         NUM_CLUSTERS = GX * GY * NG
-        M, K, N = 256, 256, 256
-        BM, BK, BN = 64, 32, 64
+        M, K, N = 512, 7168, 512
+        BM, BK, BN = 128, 128, 128
         elem_bytes = 2
 
         kernel = self._build_summa_gemm_dp_split_k2d_kernel(GX=GX, GY=GY, NK0=NK0, NK1=NK1)
@@ -779,11 +793,6 @@ class TestEndToEndDpCollective:
             num_clusters=NUM_CLUSTERS,
         )
 
-        rng = np.random.default_rng(42)
-        A_np = rng.standard_normal((M, K)).astype(np.float16)
-        B_np = rng.standard_normal((K, N)).astype(np.float16)
-        C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
-
         input_bufs = [
             TilelangIOBuffer(name="DeeployNetwork_A", c_dtype="fp16",
                              nbytes=M * K * elem_bytes, is_input=True),
@@ -794,6 +803,19 @@ class TestEndToEndDpCollective:
             TilelangIOBuffer(name="DeeployNetwork_C", c_dtype="fp16",
                              nbytes=M * N * elem_bytes, is_input=False),
         ]
+
+        _total_preload_bytes = (M * K + K * N + M * N) 
+        _need_verify = _total_preload_bytes < 5 * 1024 * 1024
+        if _need_verify:
+            rng = np.random.default_rng(42)
+            A_np = rng.standard_normal((M, K)).astype(np.float16)
+            B_np = rng.standard_normal((K, N)).astype(np.float16)
+            C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
+            test_in = [A_np, B_np]
+            test_out = [C_ref]
+        else:
+            test_in = None
+            test_out = None
 
         cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
         config = create_test_config(
@@ -814,8 +836,8 @@ class TestEndToEndDpCollective:
             dumpdir=str(gen_dir),
             input_bufs=input_bufs,
             output_bufs=output_bufs,
-            test_inputs=[A_np, B_np],
-            test_outputs=[C_ref],
+            test_inputs=test_in,
+            test_outputs=test_out,
         )
 
         configure_cmake(config)

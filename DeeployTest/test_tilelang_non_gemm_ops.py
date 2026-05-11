@@ -1540,7 +1540,7 @@ class TestTopKClusterE2E:
         def topk_dp(X, M_: int, GX_: int):
             dtype = T.float16
             X: T.Tensor((M_,), dtype)
-            MaxVal = T.empty((M_,), dtype)
+            MaxVal = T.empty((GX_,), dtype)
 
             chunk = T.ceildiv(M_, GX_)
             with T.Kernel(1, threads=1) as (bx,):
@@ -1554,7 +1554,7 @@ class TestTopKClusterE2E:
                     for i in T.serial(1, chunk):
                         mv[0] = T.max(mv[0], x_l[i])
 
-                    T.copy(mv, MaxVal[gid_x * chunk])
+                    T.copy(mv, MaxVal[gid_x])
             return MaxVal
 
         return topk_dp
@@ -1574,7 +1574,7 @@ class TestTopKClusterE2E:
         from test_softhier_config import DEFAULT_NUM_CLUSTERS as NUM_CLUSTERS
 
         GX = 2
-        M_val = 128
+        M_val = 4
         elem_bytes = 2
         fn = self._build_topk_dp_kernel(GX=GX)
 
@@ -1609,7 +1609,7 @@ class TestTopKClusterE2E:
         ]
         output_bufs = [
             TilelangIOBuffer(name="DeeployNetwork_MaxVal", c_dtype="fp16",
-                             nbytes=M_val * elem_bytes, is_input=False),
+                             nbytes=GX * elem_bytes, is_input=False),
         ]
 
         gen_dir = Path(config.gen_dir)
@@ -1666,7 +1666,7 @@ class TestAttentionGemmClusterE2E:
                     S_loc = T.alloc_fragment((BM_, BM_), dtype)
                     T.clear(S_loc)
 
-                    for bk in T.serial(T.ceildiv(D_, BK_)):
+                    for bk in T.Pipelined(T.ceildiv(D_, BK_), num_stages=2):
                         if local_x == local_y:
                             T.copy(Q[(by * GY_ + local_y) * BM_, bk * BK_], Q_loc)
                             T.copy(K[(bx * GX_ + local_x) * BM_, bk * BK_], K_loc)
@@ -1696,7 +1696,7 @@ class TestAttentionGemmClusterE2E:
         from testUtils.core import build_binary, configure_cmake, run_simulation
         from testUtils.pytestRunner import create_test_config
 
-        GX, GY = 2, 2
+        GX, GY = 4, 4
         NUM_CLUSTERS = GX * GY
         M, D = 128, 128
         BM, BK = 64, 64
@@ -2049,6 +2049,470 @@ class TestSpatzEltwiseE2E:
             tilelangBody=body, dumpdir=str(gen_dir),
             input_bufs=input_bufs, output_bufs=output_bufs,
             test_inputs=[x_fp16], test_outputs=[y_ref],
+        )
+
+        configure_cmake(config)
+        build_binary(config)
+        result = run_simulation(config)
+        assert "Simulation stopped by user" in (result.stdout or ""), \
+            "Simulation did not complete successfully"
+        _check_error_count(result, max_rel_err=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Test 19: Sigmoid DP — element-wise sigmoid distributed across 1-D cluster group
+# ---------------------------------------------------------------------------
+
+@pytest.mark.softhier
+@pytest.mark.tilelang
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="tilelang not installed")
+class TestSigmoidDpE2E:
+    """Sigmoid applied to each element, rows distributed across a 1-D cluster group.
+
+    Each cluster owns a contiguous chunk of the input and applies sigmoid
+    element-wise via T.Parallel (all intra-cluster cores share the work).
+    """
+
+    @staticmethod
+    def _build_sigmoid_dp_kernel(GX: int = 2):
+        import tilelang
+        import tilelang.language as T
+
+        @tilelang.jit
+        def sigmoid_dp(X, M_: int, GX_: int):
+            dtype = T.float16
+            X: T.Tensor((M_,), dtype)
+            Y = T.empty((M_,), dtype)
+
+            chunk = T.ceildiv(M_, GX_)
+            with T.Kernel(1, threads=1) as (bx,):
+                with T.cluster_group("dp", x=GX_, y=1, num_groups=1,
+                                     axes=("x", "y")) as (gid, gid_x, gid_y):
+                    x_l = T.alloc_fragment((chunk,), dtype)
+                    T.copy(X[gid_x * chunk], x_l)
+                    for i in T.Parallel(chunk):
+                        x_l[i] = T.sigmoid(x_l[i])
+                    T.copy(x_l, Y[gid_x * chunk])
+            return Y
+
+        return sigmoid_dp
+
+    def test_sigmoid_dp_e2e(
+        self, deeploy_test_dir: Path, toolchain_dir: str,
+        toolchain: str, cmake_args: list,
+    ):
+        from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
+        from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+        from testUtils.codeGenerate import (
+            TilelangIOBuffer, generateTilelangSoftHierTestNetwork,
+        )
+        from testUtils.core import build_binary, configure_cmake, run_simulation
+        from testUtils.pytestRunner import create_test_config
+
+        GX = 2
+        M_val = 128
+        elem_bytes = 2
+        fn = self._build_sigmoid_dp_kernel(GX=GX)
+
+        registry = ClusterGroupRegistry([
+            ClusterGroup("dp", group_x=GX, group_y=1, num_groups=1,
+                         axis_names=("x", "y"))
+        ])
+        hw = HardwareBinding({"dp": list(range(GX))})
+
+        np.random.seed(42)
+        x_fp16 = np.random.randn(M_val).astype(np.float16)
+        y_ref = (1.0 / (1.0 + np.exp(-x_fp16.astype(np.float32)))).astype(np.float16)
+
+        body = compile_tilelang_to_softhier_parallel(
+            fn, x_fp16, M_=M_val, GX_=GX,
+            group_registry=registry, hw_binding=hw, num_clusters=GX)
+
+        config = create_test_config(
+            test_name="Tilelang/sigmoid_dp_e2e",
+            platform="SoftHier", simulator="gvsoc",
+            deeploy_test_dir=deeploy_test_dir,
+            toolchain=toolchain, toolchain_dir=toolchain_dir,
+            cmake_args=list(cmake_args) + [f"num_clusters={GX}"],
+            tiling=False,
+        )
+
+        input_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_X", c_dtype="fp16",
+                             nbytes=M_val * elem_bytes, is_input=True),
+        ]
+        output_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_Y", c_dtype="fp16",
+                             nbytes=M_val * elem_bytes, is_input=False),
+        ]
+
+        gen_dir = Path(config.gen_dir)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        generateTilelangSoftHierTestNetwork(
+            tilelangBody=body, dumpdir=str(gen_dir),
+            input_bufs=input_bufs, output_bufs=output_bufs,
+            test_inputs=[x_fp16], test_outputs=[y_ref],
+        )
+
+        configure_cmake(config)
+        build_binary(config)
+        result = run_simulation(config)
+        assert "Simulation stopped by user" in (result.stdout or ""), \
+            "Simulation did not complete successfully"
+        _check_error_count(result, max_rel_err=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Test 20: Maximum DP — element-wise binary max distributed across 1-D cluster group
+# ---------------------------------------------------------------------------
+
+@pytest.mark.softhier
+@pytest.mark.tilelang
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="tilelang not installed")
+class TestMaximumDpE2E:
+    """Element-wise max(X, Y) distributed across a 1-D cluster group.
+
+    Each cluster handles a contiguous chunk; T.Parallel distributes elements
+    across intra-cluster cores.
+    """
+
+    @staticmethod
+    def _build_maximum_dp_kernel(GX: int = 2):
+        import tilelang
+        import tilelang.language as T
+
+@tilelang.jit
+def maximum_dp(X, Y, M_: int, GX_: int):
+    dtype = T.float16
+    X: T.Tensor((M_,), dtype)
+    Y: T.Tensor((M_,), dtype)
+    O = T.empty((M_,), dtype)
+
+    chunk = T.ceildiv(M_, GX_)
+    with T.Kernel(1, threads=1) as (bx,):
+        with T.cluster_group("dp", x=GX_, y=1, num_groups=1,
+                                axes=("x", "y")) as (gid, gid_x, gid_y):
+            x_l = T.alloc_fragment((chunk,), dtype)
+            y_l = T.alloc_fragment((chunk,), dtype)
+            T.copy(X[gid_x * chunk], x_l)
+            T.copy(Y[gid_x * chunk], y_l)
+            for i in T.Parallel(chunk):
+                x_l[i] = T.max(x_l[i], y_l[i])
+            T.copy(x_l, O[gid_x * chunk])
+            return O
+
+        return maximum_dp
+
+    def test_maximum_dp_e2e(
+        self, deeploy_test_dir: Path, toolchain_dir: str,
+        toolchain: str, cmake_args: list,
+    ):
+        from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
+        from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+        from testUtils.codeGenerate import (
+            TilelangIOBuffer, generateTilelangSoftHierTestNetwork,
+        )
+        from testUtils.core import build_binary, configure_cmake, run_simulation
+        from testUtils.pytestRunner import create_test_config
+
+        GX = 2
+        M_val = 128
+        elem_bytes = 2
+        fn = self._build_maximum_dp_kernel(GX=GX)
+
+        registry = ClusterGroupRegistry([
+            ClusterGroup("dp", group_x=GX, group_y=1, num_groups=1,
+                         axis_names=("x", "y"))
+        ])
+        hw = HardwareBinding({"dp": list(range(GX))})
+
+        np.random.seed(42)
+        x_fp16 = np.random.randn(M_val).astype(np.float16)
+        y_fp16 = np.random.randn(M_val).astype(np.float16)
+        o_ref = np.maximum(x_fp16.astype(np.float32),
+                           y_fp16.astype(np.float32)).astype(np.float16)
+
+        body = compile_tilelang_to_softhier_parallel(
+            fn, x_fp16, y_fp16, M_=M_val, GX_=GX,
+            group_registry=registry, hw_binding=hw, num_clusters=GX)
+
+        config = create_test_config(
+            test_name="Tilelang/maximum_dp_e2e",
+            platform="SoftHier", simulator="gvsoc",
+            deeploy_test_dir=deeploy_test_dir,
+            toolchain=toolchain, toolchain_dir=toolchain_dir,
+            cmake_args=list(cmake_args) + [f"num_clusters={GX}"],
+            tiling=False,
+        )
+
+        input_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_X", c_dtype="fp16",
+                             nbytes=M_val * elem_bytes, is_input=True),
+            TilelangIOBuffer(name="DeeployNetwork_Y", c_dtype="fp16",
+                             nbytes=M_val * elem_bytes, is_input=True),
+        ]
+        output_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_O", c_dtype="fp16",
+                             nbytes=M_val * elem_bytes, is_input=False),
+        ]
+
+        gen_dir = Path(config.gen_dir)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        generateTilelangSoftHierTestNetwork(
+            tilelangBody=body, dumpdir=str(gen_dir),
+            input_bufs=input_bufs, output_bufs=output_bufs,
+            test_inputs=[x_fp16, y_fp16], test_outputs=[o_ref],
+        )
+
+        configure_cmake(config)
+        build_binary(config)
+        result = run_simulation(config)
+        assert "Simulation stopped by user" in (result.stdout or ""), \
+            "Simulation did not complete successfully"
+        _check_error_count(result, max_rel_err=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Test 21: Softmax DP — row-wise softmax distributed across 1-D cluster group
+# ---------------------------------------------------------------------------
+
+@pytest.mark.softhier
+@pytest.mark.tilelang
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="tilelang not installed")
+class TestSoftmaxRowDpE2E:
+    """Row-wise softmax on a 2D matrix, rows distributed across a 1-D cluster group.
+
+    Each cluster handles rows_per_cluster = ceil(M_ / GX_) rows.  Within a
+    cluster the rows are processed serially with T.serial loops so there is no
+    race condition on the row_max / row_sum accumulators.
+
+    Contrast with TestSoftmaxClusterE2E (Test 17) which uses the 2-D SUMMA
+    pattern (GEMM + broadcast).  This test exercises a plain 1-D DP softmax
+    with no matrix multiply.
+    """
+
+    @staticmethod
+    def _build_softmax_dp_kernel(GX: int = 2):
+        import tilelang
+        import tilelang.language as T
+
+        @tilelang.jit
+        def softmax_dp(X, M_: int, D_: int, GX_: int):
+            dtype = T.float16
+            X: T.Tensor((M_, D_), dtype)
+            Y = T.empty((M_, D_), dtype)
+
+            rows_per_cluster = T.ceildiv(M_, GX_)
+            with T.Kernel(1, threads=1) as (bx,):
+                with T.cluster_group("dp", x=GX_, y=1, num_groups=1,
+                                        axes=("x", "y")) as (gid, gid_x, gid_y):
+                    x_l = T.alloc_fragment((rows_per_cluster, D_), dtype)
+                    row_max = T.alloc_fragment((1,), dtype)
+                    row_sum = T.alloc_fragment((1,), dtype)
+
+                    T.copy(X[gid_x * rows_per_cluster, 0], x_l)
+
+                    for r in T.Parallel(rows_per_cluster):
+                        row_max[0] = x_l[r, 0]
+                        for j in T.serial(1, D_):
+                            row_max[0] = T.max(row_max[0], x_l[r, j])
+                        for j in T.Parallel(D_):
+                            x_l[r, j] = T.exp(x_l[r, j] - row_max[0])
+                        row_sum[0] = T.reduce(x_l[r, 0], "add")
+                        for j in T.Parallel(D_):
+                            x_l[r, j] = x_l[r, j] / row_sum[0]
+
+                    T.copy(x_l, Y[gid_x * rows_per_cluster, 0])
+            return Y
+
+        return softmax_dp
+
+    def test_softmax_dp_e2e(
+        self, deeploy_test_dir: Path, toolchain_dir: str,
+        toolchain: str, cmake_args: list,
+    ):
+        from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
+        from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+        from testUtils.codeGenerate import (
+            TilelangIOBuffer, generateTilelangSoftHierTestNetwork,
+        )
+        from testUtils.core import build_binary, configure_cmake, run_simulation
+        from testUtils.pytestRunner import create_test_config
+
+        GX = 2
+        M_val = 8
+        D_val = 16
+        elem_bytes = 2
+        fn = self._build_softmax_dp_kernel(GX=GX)
+
+        registry = ClusterGroupRegistry([
+            ClusterGroup("dp", group_x=GX, group_y=1, num_groups=1,
+                         axis_names=("x", "y"))
+        ])
+        hw = HardwareBinding({"dp": list(range(GX))})
+
+        np.random.seed(42)
+        x_fp16 = np.random.randn(M_val, D_val).astype(np.float16)
+        x_f32 = x_fp16.astype(np.float32)
+        x_max = np.max(x_f32, axis=1, keepdims=True)
+        x_exp = np.exp(x_f32 - x_max)
+        y_ref = (x_exp / np.sum(x_exp, axis=1, keepdims=True)).astype(np.float16)
+
+        body = compile_tilelang_to_softhier_parallel(
+            fn, x_fp16, M_=M_val, D_=D_val, GX_=GX,
+            group_registry=registry, hw_binding=hw, num_clusters=GX)
+
+        config = create_test_config(
+            test_name="Tilelang/softmax_dp_e2e",
+            platform="SoftHier", simulator="gvsoc",
+            deeploy_test_dir=deeploy_test_dir,
+            toolchain=toolchain, toolchain_dir=toolchain_dir,
+            cmake_args=list(cmake_args) + [f"num_clusters={GX}"],
+            tiling=False,
+        )
+
+        input_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_X", c_dtype="fp16",
+                             nbytes=M_val * D_val * elem_bytes, is_input=True),
+        ]
+        output_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_Y", c_dtype="fp16",
+                             nbytes=M_val * D_val * elem_bytes, is_input=False),
+        ]
+
+        gen_dir = Path(config.gen_dir)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        generateTilelangSoftHierTestNetwork(
+            tilelangBody=body, dumpdir=str(gen_dir),
+            input_bufs=input_bufs, output_bufs=output_bufs,
+            test_inputs=[x_fp16], test_outputs=[y_ref],
+        )
+
+        configure_cmake(config)
+        build_binary(config)
+        result = run_simulation(config)
+        assert "Simulation stopped by user" in (result.stdout or ""), \
+            "Simulation did not complete successfully"
+        _check_error_count(result, max_rel_err=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Test 22: Top-K General DP — find top-K values per chunk across 1-D cluster group
+# ---------------------------------------------------------------------------
+
+@pytest.mark.softhier
+@pytest.mark.tilelang
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="tilelang not installed")
+class TestTopKGeneralDpE2E:
+    """Find top-K largest values in each cluster's chunk via repeated serial max-find.
+
+    Follows the MoE reference pattern (topk_gate_kernel.py) but adapted for
+    SoftHier's serial execution model: all reductions use T.serial so only
+    core 0 runs the max-find and mask loops, avoiding the data race that would
+    arise with T.Parallel writing to a scalar accumulator.
+
+    Algorithm per cluster:
+      for k in K:
+          cur_max = serial max over x_l
+          top_vals[k] = cur_max
+          mask x_l[i] = NEG_INF where x_l[i] == cur_max  (serial)
+    """
+
+    @staticmethod
+    def _build_topk_general_dp_kernel(GX: int = 2):
+        import tilelang
+        import tilelang.language as T
+
+        @tilelang.jit
+        def topk_general_dp(X, M_: int, K_: int, GX_: int):
+            dtype = T.float16
+            X: T.Tensor((M_,), dtype)
+            TopVals = T.empty((GX_ * K_,), dtype)
+
+            chunk = T.ceildiv(M_, GX_)
+            with T.Kernel(1, threads=1) as (bx,):
+                with T.cluster_group("dp", x=GX_, y=1, num_groups=1,
+                                     axes=("x", "y")) as (gid, gid_x, gid_y):
+                    x_l = T.alloc_fragment((chunk,), dtype)
+                    top_vals = T.alloc_fragment((K_,), dtype)
+                    cur_max = T.alloc_fragment((1,), dtype)
+
+                    T.copy(X[gid_x * chunk], x_l)
+
+                    for k in T.serial(K_):
+                        cur_max[0] = x_l[0]
+                        for i in T.serial(1, chunk):
+                            cur_max[0] = T.max(cur_max[0], x_l[i])
+                        top_vals[k] = cur_max[0]
+                        for i in T.serial(chunk):
+                            if x_l[i] == cur_max[0]:
+                                x_l[i] = T.float16(-65504.0)
+
+                    T.copy(top_vals, TopVals[gid_x * K_])
+            return TopVals
+
+        return topk_general_dp
+
+    def test_topk_general_dp_e2e(
+        self, deeploy_test_dir: Path, toolchain_dir: str,
+        toolchain: str, cmake_args: list,
+    ):
+        from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
+        from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+        from testUtils.codeGenerate import (
+            TilelangIOBuffer, generateTilelangSoftHierTestNetwork,
+        )
+        from testUtils.core import build_binary, configure_cmake, run_simulation
+        from testUtils.pytestRunner import create_test_config
+
+        GX = 2
+        K_val = 2
+        M_val = 8
+        elem_bytes = 2
+        fn = self._build_topk_general_dp_kernel(GX=GX)
+
+        registry = ClusterGroupRegistry([
+            ClusterGroup("dp", group_x=GX, group_y=1, num_groups=1,
+                         axis_names=("x", "y"))
+        ])
+        hw = HardwareBinding({"dp": list(range(GX))})
+
+        np.random.seed(42)
+        x_fp16 = np.random.randn(M_val).astype(np.float16)
+        chunk = (M_val + GX - 1) // GX
+        ref_topk = np.concatenate([
+            np.sort(x_fp16.astype(np.float32)[i * chunk:(i + 1) * chunk])[::-1][:K_val]
+            for i in range(GX)
+        ]).astype(np.float16)
+
+        body = compile_tilelang_to_softhier_parallel(
+            fn, x_fp16, M_=M_val, K_=K_val, GX_=GX,
+            group_registry=registry, hw_binding=hw, num_clusters=GX)
+
+        config = create_test_config(
+            test_name="Tilelang/topk_general_dp_e2e",
+            platform="SoftHier", simulator="gvsoc",
+            deeploy_test_dir=deeploy_test_dir,
+            toolchain=toolchain, toolchain_dir=toolchain_dir,
+            cmake_args=list(cmake_args) + [f"num_clusters={GX}"],
+            tiling=False,
+        )
+
+        input_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_X", c_dtype="fp16",
+                             nbytes=M_val * elem_bytes, is_input=True),
+        ]
+        output_bufs = [
+            TilelangIOBuffer(name="DeeployNetwork_TopVals", c_dtype="fp16",
+                             nbytes=GX * K_val * elem_bytes, is_input=False),
+        ]
+
+        gen_dir = Path(config.gen_dir)
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        generateTilelangSoftHierTestNetwork(
+            tilelangBody=body, dumpdir=str(gen_dir),
+            input_bufs=input_bufs, output_bufs=output_bufs,
+            test_inputs=[x_fp16], test_outputs=[ref_topk],
         )
 
         configure_cmake(config)

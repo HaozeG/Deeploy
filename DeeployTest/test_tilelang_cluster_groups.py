@@ -1381,9 +1381,8 @@ class TestCannonGemmCompilation:
         # Stub emits a group-scoped barrier so all clusters stay in lockstep.
         assert "grid_sync_group_barrier_xy" in code, \
             "Expected group barrier in Cannon shift stub"
-        # Stub also emits a void-cast no-op on the source buffer.
-        assert "(void)" in code, \
-            "Expected no-op void cast in Cannon shift stub"
+        # v2: shift now emits flex_dma_async_pattern_round_shift_* DMA calls
+        # instead of the old no-op void cast.
         assert "group_info_cannon_group" in code, \
             "Expected cannon_group info struct in generated code"
 
