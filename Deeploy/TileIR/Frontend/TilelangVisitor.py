@@ -133,11 +133,17 @@ from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
     TileEltwiseTemplate,
     TileFillTemplate,
     TileFreeTemplate,
+    TileInnerEltwiseTemplate,
     TileLoadTemplate,
+    TileParallelCoreCloseTemplate,
+    TileParallelCoreOpenTemplate,
     TileReduceTemplate,
     TileStoreTemplate,
     TileSyncTemplate,
     TileGemmTemplate,
+    TileGemmTransposeABTemplate,
+    TileGemmTransposeATemplate,
+    TileGemmTransposeBTemplate,
 )
 
 # ---------------------------------------------------------------------------
@@ -247,19 +253,34 @@ class _ExprStringifier:
         return f"((fp16*){mangled})[{' + '.join(terms)}]"
 
     def _str_Add(self, expr) -> str:
-        return f"({self.stringify(expr.a)} + {self.stringify(expr.b)})"
+        a, b = self.stringify(expr.a), self.stringify(expr.b)
+        if str(expr.dtype) == "float16":
+            return f"float_to_fp16(fp16_to_float({a}) + fp16_to_float({b}))"
+        return f"({a} + {b})"
 
     def _str_Sub(self, expr) -> str:
-        return f"({self.stringify(expr.a)} - {self.stringify(expr.b)})"
+        a, b = self.stringify(expr.a), self.stringify(expr.b)
+        if str(expr.dtype) == "float16":
+            return f"float_to_fp16(fp16_to_float({a}) - fp16_to_float({b}))"
+        return f"({a} - {b})"
 
     def _str_Mul(self, expr) -> str:
-        return f"({self.stringify(expr.a)} * {self.stringify(expr.b)})"
+        a, b = self.stringify(expr.a), self.stringify(expr.b)
+        if str(expr.dtype) == "float16":
+            return f"float_to_fp16(fp16_to_float({a}) * fp16_to_float({b}))"
+        return f"({a} * {b})"
 
     def _str_Div(self, expr) -> str:
-        return f"({self.stringify(expr.a)} / {self.stringify(expr.b)})"
+        a, b = self.stringify(expr.a), self.stringify(expr.b)
+        if str(expr.dtype) == "float16":
+            return f"float_to_fp16(fp16_to_float({a}) / fp16_to_float({b}))"
+        return f"({a} / {b})"
 
     def _str_FloorDiv(self, expr) -> str:
-        return f"({self.stringify(expr.a)} / {self.stringify(expr.b)})"
+        a, b = self.stringify(expr.a), self.stringify(expr.b)
+        if str(expr.dtype) == "float16":
+            return f"float_to_fp16(fp16_to_float({a}) / fp16_to_float({b}))"
+        return f"({a} / {b})"
 
     def _str_FloorMod(self, expr) -> str:
         return f"({self.stringify(expr.a)} % {self.stringify(expr.b)})"
@@ -277,7 +298,10 @@ class _ExprStringifier:
         return f"(({c_type}){self.stringify(expr.value)})"
 
     def _str_FloatImm(self, expr) -> str:
-        return repr(float(expr.value))
+        val = repr(float(expr.value))
+        if str(expr.dtype) == "float16":
+            return f"float_to_fp16({val}f)"
+        return val
 
     def _str_IntImm(self, expr) -> str:
         return str(int(expr.value))
@@ -1414,7 +1438,7 @@ class TilelangVisitor:
             rep_open = {
                 "loop_var":   loop_var,
                 "min_val":    min_val,
-                "extent":     int(stmt.extent),
+                "extent":     extent,  # = min + stmt.extent (exclusive upper bound)
                 "cluster_id": None,  # loop brace itself has no cluster guard
             }
             self._emit_binding("for_open", ForLoopOpenTemplate, rep_open)
@@ -1604,12 +1628,14 @@ class TilelangVisitor:
         })
 
     def _handle_gemm_py(self, args: list, cluster_id):
-        """T.gemm(A_region, B_region, C_region, M, N, K) → TileGemm."""
+        """T.gemm(A_region, B_region, C_region, transpose_A, transpose_B, M, N, K, ...) → TileGemm."""
         if len(args) < 8:
             return
         A_region = args[0]
         B_region = args[1]
         C_region = args[2]
+        transpose_A = bool(int(args[3])) if len(args) > 3 and hasattr(args[3], "__int__") else False
+        transpose_B = bool(int(args[4])) if len(args) > 4 and hasattr(args[4], "__int__") else False
         M        = int(args[5]) if hasattr(args[5], "__int__") else str(args[5])
         N        = int(args[6]) if hasattr(args[6], "__int__") else str(args[6])
         K        = int(args[7]) if hasattr(args[7], "__int__") else str(args[7])
@@ -1632,9 +1658,15 @@ class TilelangVisitor:
             'uint8':  'REDMULE_UINT_8',
             'int8':   'REDMULE_INT_8',
         }
+        elem_size_mapping = {
+            'float32': 4, 'uint32': 4, 'int32': 4,
+            'float16': 2, 'uint16': 2, 'int16': 2,
+            'uint8': 1, 'int8': 1,
+        }
         A_buf = self._local_bufs.get(A_buf_name) or self._global_bufs.get(A_buf_name)
         A_dtype = str(A_buf.dtype) if A_buf is not None else "float16"
         redmule_dtype_str = redmule_dtype_mapping.get(A_dtype, "REDMULE_FP_16")
+        elem_size = elem_size_mapping.get(A_dtype, 2)
 
         rep = {
             "A":          A_buf_name,
@@ -1645,9 +1677,20 @@ class TilelangVisitor:
             "K":          K,
             "cluster_id": resolved_cluster_id,
             "redmule_dtype": redmule_dtype_str,
+            "elem_size":  elem_size,
             "metadata":   op_metadata,
         }
-        self._emit_binding("gemm", TileGemmTemplate, rep)
+
+        if transpose_A and transpose_B:
+            gemm_template = TileGemmTransposeABTemplate
+        elif transpose_A:
+            gemm_template = TileGemmTransposeATemplate
+        elif transpose_B:
+            gemm_template = TileGemmTransposeBTemplate
+        else:
+            gemm_template = TileGemmTemplate
+
+        self._emit_binding("gemm", gemm_template, rep)
         # TODO: consider adding a pass to fuse unnecessary syncs
         self._emit_binding("sync", TileSyncTemplate, {
             "cluster_id": resolved_cluster_id,
@@ -1655,22 +1698,38 @@ class TilelangVisitor:
         })
 
     def _handle_parallel_for(self, stmt, loop_var: str, extent: int, cluster_id):
-        # TODO: consider using vector unit by SIMD ops
         """Parallel For with BufferStore body → TileEltwise.
 
         Supports single BufferStore and SeqStmt of multiple BufferStores
         (fused element-wise kernels with multiple outputs).
+
+        Handles nested Parallel/Serial loops robustly:
+        - Flat Parallel(var, BufferStore)         → TileEltwiseTemplate (1-D)
+        - Parallel(outer, Parallel/Serial(inner, BufferStore))
+                                                  → TileParallelCoreOpen +
+                                                    TileInnerEltwiseTemplate +
+                                                    TileParallelCoreClose
+          Two sub-cases detected:
+            Bug-1: inner loop has kind==1 (T.Serial uppercase or T.Parallel) —
+                   the while-loop strips it; inner_loop_var/inner_extent are set.
+            Bug-2: inner loop has kind==0 (T.serial lowercase) — the while-loop
+                   does NOT run; body_cls=="For" with kind==0 is detected below.
         """
         body = stmt.body
-        # Unwrap nested parallel For loops
+        # Unwrap nested Parallel-kind For loops.
+        # Track whether the loop ran (inner_loop_var is None if not).
+        inner_loop_var = None
+        inner_extent   = None
         while type(body).__name__ == "For" and int(body.kind) == 1:
             inner_body     = body.body
             inner_loop_var = str(body.loop_var.name)
             inner_extent   = int(body.extent)
-            body = inner_body
+            body           = inner_body
+
+        # ── helpers ────────────────────────────────────────────────────────
 
         def _emit_one_parallel_store(store_stmt):
-            """Emit a single TileEltwiseTemplate from a BufferStore."""
+            """Emit a single TileEltwiseTemplate from a BufferStore (1-D flat)."""
             dst_name  = store_stmt.buffer.name
             src_expr  = _STRINGIFIER.stringify(store_stmt.value)
             buf       = (self._local_bufs.get(dst_name) or
@@ -1694,37 +1753,50 @@ class TilelangVisitor:
             self._emit_binding("eltwise", TileEltwiseTemplate, rep)
             return resolved_cid
 
-        body_cls = type(body).__name__
+        def _row_stride(store_stmt):
+            """Product of buffer dims after dim-0 (= row stride in elements)."""
+            shape = [int(s) for s in store_stmt.buffer.shape]
+            stride = 1
+            for s in shape[1:]:
+                stride *= s
+            return stride
 
-        if body_cls == "BufferStore":
-            resolved_cid = _emit_one_parallel_store(body)
-            self._emit_binding("sync", TileSyncTemplate, {
-                "cluster_id": resolved_cid,
-                "metadata": self._op_metadata(cluster_id)[1],
+        def _emit_inner_eltwise_only(store_stmt, inner_var, inner_ext):
+            """Emit TileInnerEltwiseTemplate; caller handles open/close."""
+            dst_name = store_stmt.buffer.name
+            src_expr = _STRINGIFIER.stringify(store_stmt.value)
+            buf = (self._local_bufs.get(dst_name) or
+                   self._global_bufs.get(dst_name))
+            dtype = _c_dtype(str(buf.dtype)) if buf else "fp16"
+            resolved_cid, op_meta = self._op_metadata(
+                cluster_id, dst_buffers=[dst_name])
+            idx_expr = self._linearize_indices(store_stmt)
+            self._emit_binding("eltwise", TileInnerEltwiseTemplate, {
+                "dst":            dst_name,
+                "src_expr":       src_expr,
+                "loop_var":       inner_var,
+                "index_expr":     idx_expr,
+                "extent":         inner_ext,
+                "dtype":          dtype,
+                "cluster_id":     resolved_cid,
+                "metadata":       op_meta,
+                "outer_loop_var": loop_var,
+                "dst_stride":     _row_stride(store_stmt),
             })
-        elif body_cls == "SeqStmt":
-            stores = list(body.seq)
-            if stores and all(type(s).__name__ == "BufferStore" for s in stores):
-                last_cid = cluster_id
-                for s in stores:
-                    last_cid = _emit_one_parallel_store(s)
-                self._emit_binding("sync", TileSyncTemplate, {
-                    "cluster_id": last_cid,
-                    "metadata": self._op_metadata(cluster_id)[1],
-                })
-            else:
-                # SeqStmt with non-BufferStore content — fall back to serial
-                rep_open = {
-                    "loop_var":   loop_var,
-                    "min_val":    0,
-                    "extent":     extent,
-                    "cluster_id": None,
-                }
-                self._emit_binding("for_open", ForLoopOpenTemplate, rep_open)
-                self._visit_stmt(stmt.body, cluster_id)
-                self._emit_binding("for_close", ForLoopCloseTemplate, {"loop_var": loop_var})
-        else:
-            # Fallback: emit a serial loop
+            return resolved_cid
+
+        def _emit_parallel_core_inner(store_stmt, inner_var, inner_ext):
+            """Emit ParallelCoreOpen + TileInnerEltwise + ParallelCoreClose."""
+            resolved_cid, _ = self._op_metadata(
+                cluster_id, dst_buffers=[store_stmt.buffer.name])
+            self._emit_binding("for_open", TileParallelCoreOpenTemplate, {
+                "loop_var": loop_var, "extent": extent, "cluster_id": resolved_cid})
+            _emit_inner_eltwise_only(store_stmt, inner_var, inner_ext)
+            self._emit_binding("for_close", TileParallelCoreCloseTemplate,
+                               {"loop_var": loop_var})
+            return resolved_cid
+
+        def _emit_serial_fallback():
             rep_open = {
                 "loop_var":   loop_var,
                 "min_val":    0,
@@ -1733,7 +1805,105 @@ class TilelangVisitor:
             }
             self._emit_binding("for_open", ForLoopOpenTemplate, rep_open)
             self._visit_stmt(stmt.body, cluster_id)
-            self._emit_binding("for_close", ForLoopCloseTemplate, {"loop_var": loop_var})
+            self._emit_binding("for_close", ForLoopCloseTemplate,
+                               {"loop_var": loop_var})
+
+        # ── dispatch ───────────────────────────────────────────────────────
+
+        body_cls = type(body).__name__
+
+        # ── Case 1: single BufferStore ──────────────────────────────────
+        if body_cls == "BufferStore":
+            if inner_loop_var is None:
+                # Flat 1-D: Parallel(loop_var, BufferStore)
+                resolved_cid = _emit_one_parallel_store(body)
+            else:
+                # Bug-1 fix: while-loop stripped inner loop (T.Serial uppercase)
+                resolved_cid = _emit_parallel_core_inner(
+                    body, inner_loop_var, inner_extent)
+            self._emit_binding("sync", TileSyncTemplate, {
+                "cluster_id": resolved_cid,
+                "metadata": self._op_metadata(cluster_id)[1],
+            })
+
+        # ── Case 2: SeqStmt ─────────────────────────────────────────────
+        elif body_cls == "SeqStmt":
+            stores    = list(body.seq)
+            all_bufs  = stores and all(
+                type(s).__name__ == "BufferStore" for s in stores)
+            if all_bufs and inner_loop_var is None:
+                # Flat multi-output (original behaviour)
+                last_cid = cluster_id
+                for s in stores:
+                    last_cid = _emit_one_parallel_store(s)
+                self._emit_binding("sync", TileSyncTemplate, {
+                    "cluster_id": last_cid,
+                    "metadata": self._op_metadata(cluster_id)[1],
+                })
+            elif all_bufs and inner_loop_var is not None:
+                # Bug-1 fix for multi-output: one open/close, multiple inner eltwises
+                first_cid, _ = self._op_metadata(
+                    cluster_id, dst_buffers=[stores[0].buffer.name])
+                self._emit_binding("for_open", TileParallelCoreOpenTemplate, {
+                    "loop_var": loop_var, "extent": extent, "cluster_id": first_cid})
+                last_cid = cluster_id
+                for s in stores:
+                    last_cid = _emit_inner_eltwise_only(s, inner_loop_var, inner_extent)
+                self._emit_binding("for_close", TileParallelCoreCloseTemplate,
+                                   {"loop_var": loop_var})
+                self._emit_binding("sync", TileSyncTemplate, {
+                    "cluster_id": last_cid,
+                    "metadata": self._op_metadata(cluster_id)[1],
+                })
+            else:
+                # SeqStmt with non-BufferStore content — fall back to serial
+                _emit_serial_fallback()
+
+        # ── Case 3: Serial inner For (Bug-2 fix — T.serial lowercase) ───
+        elif body_cls == "For" and int(body.kind) == 0:
+            serial_var    = str(body.loop_var.name)
+            serial_extent = int(body.extent)
+            serial_body   = body.body
+            sb_cls        = type(serial_body).__name__
+
+            if sb_cls == "BufferStore":
+                resolved_cid = _emit_parallel_core_inner(
+                    serial_body, serial_var, serial_extent)
+                self._emit_binding("sync", TileSyncTemplate, {
+                    "cluster_id": resolved_cid,
+                    "metadata": self._op_metadata(cluster_id)[1],
+                })
+            elif sb_cls == "SeqStmt":
+                stores   = list(serial_body.seq)
+                all_bufs = stores and all(
+                    type(s).__name__ == "BufferStore" for s in stores)
+                if all_bufs:
+                    first_cid, _ = self._op_metadata(
+                        cluster_id, dst_buffers=[stores[0].buffer.name])
+                    self._emit_binding(
+                        "for_open", TileParallelCoreOpenTemplate, {
+                            "loop_var": loop_var, "extent": extent,
+                            "cluster_id": first_cid})
+                    last_cid = cluster_id
+                    for s in stores:
+                        last_cid = _emit_inner_eltwise_only(
+                            s, serial_var, serial_extent)
+                    self._emit_binding(
+                        "for_close", TileParallelCoreCloseTemplate,
+                        {"loop_var": loop_var})
+                    self._emit_binding("sync", TileSyncTemplate, {
+                        "cluster_id": last_cid,
+                        "metadata": self._op_metadata(cluster_id)[1],
+                    })
+                else:
+                    _emit_serial_fallback()
+            else:
+                # Deeper nesting — fall back to serial
+                _emit_serial_fallback()
+
+        # ── Fallback ─────────────────────────────────────────────────────
+        else:
+            _emit_serial_fallback()
 
     @staticmethod
     def _linearize_indices(stmt) -> str:

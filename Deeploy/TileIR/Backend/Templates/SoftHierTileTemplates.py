@@ -140,6 +140,7 @@ TileLoadTemplate = NodeTemplate(TileLoadTemplateStr)
 
 TileStoreTemplateStr = r"""
 // TileStore: L1 -> HBM  (${src} -> ${dst}, ${num_rows} x ${row_bytes} bytes)
+flex_intra_cluster_sync();
 if (flex_is_dm_core()) {
     uint64_t _dst_hbm = (uint64_t)(uintptr_t)((char*)${dst} + ${dst_offset});
     uint64_t _src_l1  = (uint64_t)(uintptr_t)${src};
@@ -245,6 +246,94 @@ if (flex_is_first_core()) {
 TileGemmTemplate = NodeTemplate(TileGemmTemplateStr)
 
 # ---------------------------------------------------------------------------
+# TileGemmTransposeB — transpose B in-place via flex_transpose_engine, then GEMM.
+#
+# OperatorRepresentation keys (same as TileGemm, plus):
+#   elem_size   : int  — element byte width (1=i8/u8, 2=fp16/i16/u16, 4=fp32)
+#
+# B is stored as [N×K]; after transpose it becomes [K×N] usable by RedMule.
+# ---------------------------------------------------------------------------
+
+TileGemmTransposeBTemplateStr = r"""
+// TileGemm: RedMule GEMM  C = A x B^T  with M=${M}, N=${N}, K=${K}
+if (flex_is_dm_core()) {
+    flex_transpose_engine_config(${N}, ${K}, (uint32_t)(uintptr_t)${B}, (uint32_t)(uintptr_t)${B}, ${elem_size});
+    flex_transpose_engine_trigger();
+    flex_transpose_engine_wait();
+}
+flex_intra_cluster_sync();
+if (flex_is_first_core()) {
+    flex_redmule_config((uint16_t)${M}, (uint16_t)${K}, (uint16_t)${N});
+    flex_redmule_trigger(
+        (uint32_t)(uintptr_t)${A},
+        (uint32_t)(uintptr_t)${B},
+        (uint32_t)(uintptr_t)${C},
+        ${redmule_dtype}
+    );
+    flex_redmule_wait();
+}
+"""
+
+TileGemmTransposeBTemplate = NodeTemplate(TileGemmTransposeBTemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileGemmTransposeA — transpose A in-place via flex_transpose_engine, then GEMM.
+#
+# A is stored as [K×M]; after transpose it becomes [M×K] usable by RedMule.
+# ---------------------------------------------------------------------------
+
+TileGemmTransposeATemplateStr = r"""
+// TileGemm: RedMule GEMM  C = A^T x B  with M=${M}, N=${N}, K=${K}
+if (flex_is_dm_core()) {
+    flex_transpose_engine_config(${K}, ${M}, (uint32_t)(uintptr_t)${A}, (uint32_t)(uintptr_t)${A}, ${elem_size});
+    flex_transpose_engine_trigger();
+    flex_transpose_engine_wait();
+}
+flex_intra_cluster_sync();
+if (flex_is_first_core()) {
+    flex_redmule_config((uint16_t)${M}, (uint16_t)${K}, (uint16_t)${N});
+    flex_redmule_trigger(
+        (uint32_t)(uintptr_t)${A},
+        (uint32_t)(uintptr_t)${B},
+        (uint32_t)(uintptr_t)${C},
+        ${redmule_dtype}
+    );
+    flex_redmule_wait();
+}
+"""
+
+TileGemmTransposeATemplate = NodeTemplate(TileGemmTransposeATemplateStr)
+
+# ---------------------------------------------------------------------------
+# TileGemmTransposeAB — transpose both A and B in-place, then GEMM.
+# ---------------------------------------------------------------------------
+
+TileGemmTransposeABTemplateStr = r"""
+// TileGemm: RedMule GEMM  C = A^T x B^T  with M=${M}, N=${N}, K=${K}
+if (flex_is_dm_core()) {
+    flex_transpose_engine_config(${K}, ${M}, (uint32_t)(uintptr_t)${A}, (uint32_t)(uintptr_t)${A}, ${elem_size});
+    flex_transpose_engine_trigger();
+    flex_transpose_engine_wait();
+    flex_transpose_engine_config(${N}, ${K}, (uint32_t)(uintptr_t)${B}, (uint32_t)(uintptr_t)${B}, ${elem_size});
+    flex_transpose_engine_trigger();
+    flex_transpose_engine_wait();
+}
+flex_intra_cluster_sync();
+if (flex_is_first_core()) {
+    flex_redmule_config((uint16_t)${M}, (uint16_t)${K}, (uint16_t)${N});
+    flex_redmule_trigger(
+        (uint32_t)(uintptr_t)${A},
+        (uint32_t)(uintptr_t)${B},
+        (uint32_t)(uintptr_t)${C},
+        ${redmule_dtype}
+    );
+    flex_redmule_wait();
+}
+"""
+
+TileGemmTransposeABTemplate = NodeTemplate(TileGemmTransposeABTemplateStr)
+
+# ---------------------------------------------------------------------------
 # TileEltwise — element-wise operation, typically from a BufferStore in a
 # parallel For loop.  Parallelised across cores.
 #
@@ -270,28 +359,85 @@ TileEltwiseTemplateStr = r"""
 
 TileEltwiseTemplate = NodeTemplate(TileEltwiseTemplateStr)
 
+# ---------------------------------------------------------------------------
+# Parallel-core open/close — bracket an inner eltwise with an outer loop
+# that distributes its variable across cores (core_id stride).
+#
+# Usage: TileParallelCoreOpenTemplate ... TileInnerEltwiseTemplate ...
+#        TileParallelCoreCloseTemplate
+#
+# OperatorRepresentation keys:
+#   loop_var : str   — outer induction variable
+#   extent   : int   — outer loop bound
+#   cluster_id : Optional[int]
+# ---------------------------------------------------------------------------
+
+TileParallelCoreOpenTemplateStr = r"""
+// ParallelCore: distribute ${loop_var} across cores
+{
+    uint32_t core_id = flex_get_core_id();
+    for (uint32_t ${loop_var} = core_id; ${loop_var} < ${extent}; ${loop_var} += ARCH_NUM_CORE_PER_CLUSTER) {
+"""
+
+TileParallelCoreOpenTemplate = NodeTemplate(TileParallelCoreOpenTemplateStr)
+
+TileParallelCoreCloseTemplateStr = r"""
+    } // end parallel_core ${loop_var}
+}
+"""
+
+TileParallelCoreCloseTemplate = NodeTemplate(TileParallelCoreCloseTemplateStr)
+
+# ---------------------------------------------------------------------------
+# InnerEltwise — lives inside a TileParallelCoreOpen block.
+# No core_id distribution; the outer parallel-core loop already partitions
+# the work.  Vectorizable by SpatzVectorizationPass → SpatzInnerEltwiseTemplate.
+#
+# OperatorRepresentation keys (same as TileEltwiseTemplate plus):
+#   outer_loop_var : str  — outer parallel induction variable (for Spatz pass)
+#   dst_stride     : int  — product of buffer dims after dim-0 (row stride in elems)
+# ---------------------------------------------------------------------------
+
+TileInnerEltwiseTemplateStr = r"""
+// InnerEltwise: ${dst}[i] = ${src_expr}  (${extent} elements, inner serial)
+for (uint32_t ${loop_var} = 0; ${loop_var} < ${extent}; ${loop_var}++) {
+    ((${dtype}*)${dst})[${index_expr}] = (${dtype})(${src_expr});
+}
+"""
+
+TileInnerEltwiseTemplate = NodeTemplate(TileInnerEltwiseTemplateStr)
+
+
+# SpatzContext: emitted once at function scope (prepended by SpatzVectorizationPass).
+# Declares _spatz_attached and _spatz_sid so every SpatzEltwiseTemplate in the
+# same function can skip the repeated volatile array reads.
+# The volatile array trick prevents GCC from auto-vectorizing the init (which
+# would clobber v8/v16 before inline asm uses them).
+SpatzContextTemplateStr = r"""
+// SpatzContext: read Spatz config once for this core (reused by all SpatzEltwise ops)
+volatile uint32_t _spatz_check_ctx[ARCH_NUM_CORE_PER_CLUSTER];
+do {
+    const uint32_t _tmp[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_CHECK_LIST;
+    for (uint32_t _i = 0; _i < ARCH_NUM_CORE_PER_CLUSTER; _i++)
+        _spatz_check_ctx[_i] = _tmp[_i];
+} while (0);
+uint32_t _spatz_attached = _spatz_check_ctx[flex_get_core_id()];
+volatile uint32_t _spatz_sids_ctx[ARCH_NUM_CORE_PER_CLUSTER];
+do {
+    const uint32_t _tmp[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_SID_LIST;
+    for (uint32_t _i = 0; _i < ARCH_NUM_CORE_PER_CLUSTER; _i++)
+        _spatz_sids_ctx[_i] = _tmp[_i];
+} while (0);
+uint32_t _spatz_sid = _spatz_attached ? _spatz_sids_ctx[flex_get_core_id()] : 0;
+"""
+
+SpatzContextTemplate = NodeTemplate(SpatzContextTemplateStr)
 
 SpatzEltwiseTemplateStr = r"""
 // SpatzEltwise: vectorized ${spatz_op} on ${dst} (${extent} elements, ${num_spatz} Spatz cores)
+// _spatz_attached and _spatz_sid are declared once by SpatzContextTemplate at function scope.
 {
-    // Read Spatz config via volatile pointer to prevent GCC from
-    // auto-vectorizing the array init (which would clobber v8/v16
-    // before our inline asm uses them).
-    volatile uint32_t _spatz_check[ARCH_NUM_CORE_PER_CLUSTER];
-    do {
-        const uint32_t _tmp[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_CHECK_LIST;
-        for (uint32_t _i = 0; _i < ARCH_NUM_CORE_PER_CLUSTER; _i++)
-            _spatz_check[_i] = _tmp[_i];
-    } while (0);
-    uint32_t _spatz_attached = _spatz_check[flex_get_core_id()];
     if (_spatz_attached) {
-        volatile uint32_t _spatz_sids[ARCH_NUM_CORE_PER_CLUSTER];
-        do {
-            const uint32_t _tmp[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_SID_LIST;
-            for (uint32_t _i = 0; _i < ARCH_NUM_CORE_PER_CLUSTER; _i++)
-                _spatz_sids[_i] = _tmp[_i];
-        } while (0);
-        uint32_t _spatz_sid = _spatz_sids[flex_get_core_id()];
         uint32_t _vlen = ${extent} / ARCH_SPATZ_ATTACED_CORES;
         uint32_t _addr = (uint32_t)(uintptr_t)${dst} + _spatz_sid * _vlen * sizeof(${dtype});
         ${spatz_setup}
@@ -302,17 +448,54 @@ SpatzEltwiseTemplateStr = r"""
             _vlen -= _avl;
             _addr += _avl * sizeof(${dtype});
         }
-    } else {
-        // Scalar fallback — same as TileEltwiseTemplate
-        uint32_t core_id = flex_get_core_id();
-        for (uint32_t ${loop_var} = core_id; ${loop_var} < ${extent}; ${loop_var} += ARCH_NUM_CORE_PER_CLUSTER) {
-            ((${dtype}*)${dst})[${loop_var}] = (${dtype})(${fallback_expr});
-        }
     }
 }
 """
 
 SpatzEltwiseTemplate = NodeTemplate(SpatzEltwiseTemplateStr)
+
+# ---------------------------------------------------------------------------
+# SpatzInnerEltwise — vectorized inner eltwise nested inside a
+# TileParallelCoreOpen block.  _addr and every _addr_src produced by
+# SpatzVectorizationPass are shifted by outer_loop_var * dst_stride to
+# select the correct row.  The else-branch provides a scalar fallback for
+# non-Spatz cores (which still have rows assigned to them by the outer loop).
+#
+# OperatorRepresentation keys (same as SpatzEltwiseTemplate plus):
+#   outer_loop_var : str  — outer induction variable (in scope from caller)
+#   dst_stride     : int  — row stride of dst in elements
+#   loop_var       : str  — inner induction variable (for fallback loop)
+#   index_expr     : str  — full linearized index for fallback (uses both vars)
+#   fallback_expr  : str  — scalar rhs expression for fallback
+# ---------------------------------------------------------------------------
+
+SpatzInnerEltwiseTemplateStr = r"""
+// SpatzInnerEltwise: vectorized ${spatz_op} on ${dst}[${outer_loop_var},:]
+// (${extent} elements, ${num_spatz} Spatz cores; row offset = ${outer_loop_var}*${dst_stride})
+// _spatz_attached and _spatz_sid are declared once by SpatzContextTemplate.
+{
+    if (_spatz_attached) {
+        uint32_t _vlen = ${extent} / ARCH_SPATZ_ATTACED_CORES;
+        uint32_t _addr = (uint32_t)(uintptr_t)${dst}
+                         + (${outer_loop_var} * ${dst_stride}) * sizeof(${dtype})
+                         + _spatz_sid * _vlen * sizeof(${dtype});
+        ${spatz_setup}
+        uint32_t _avl;
+        while (_vlen > 0) {
+            asm volatile("vsetvli %0, %1, e16, m8, ta, ma" : "=r"(_avl) : "r"(_vlen));
+            ${spatz_body}
+            _vlen -= _avl;
+            _addr += _avl * sizeof(${dtype});
+        }
+    } else {
+        for (uint32_t ${loop_var} = 0; ${loop_var} < ${extent}; ${loop_var}++) {
+            ((${dtype}*)${dst})[${index_expr}] = (${dtype})(${fallback_expr});
+        }
+    }
+}
+"""
+
+SpatzInnerEltwiseTemplate = NodeTemplate(SpatzInnerEltwiseTemplateStr)
 
 
 # ---------------------------------------------------------------------------

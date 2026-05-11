@@ -57,7 +57,7 @@ target_compile_options(softhier-sdk INTERFACE
 )
 
 set(SOFTHIER_LINKER_SCRIPT
-${SOFTHIER_RUNTIME_HOME}/flex_memory_deeploy.ld
+${SOFTHIER_RUNTIME_HOME}/flex_memory.ld
 )
 
 set(SOFTHIER_LINK_OPTIONS

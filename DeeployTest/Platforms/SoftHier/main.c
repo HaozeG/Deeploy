@@ -16,11 +16,12 @@
 #include "flex_printf.h"
 #include "flex_redmule.h"
 #include "flex_runtime.h"
+#include "flex_transpose_engine.h"
 
 // float32_t is defined in Generic types.h
 typedef float float32_t;
 
-#define ENABLE_VERIFY 0
+#define ENABLE_VERIFY 1
 
 // Deeploy-generated
 #include "Network.h"
@@ -323,19 +324,19 @@ int main() {
             expected = fp16_to_float(((fp16 *)testOutputVector[buf])[i]);
             actual = fp16_to_float(((fp16 *)DeeployNetwork_outputs[buf])[i]);
           }
-          /* Emit structured output for Python-side np.allclose verification */
-          //   printf("DEEPLOY_OUT[%lu][%lu]=%f\n", (unsigned long)buf,
-          //   (unsigned long)i, actual);
 
           diff = expected - actual;
+          if (expected == actual) {
+            diff = 0.0f; // handle exact match, including infinities, to avoid NaN diff
+          }
           float abs_diff = diff < 0.0f ? -diff : diff;
           float thresh = VERIFY_ATOL +
                          VERIFY_RTOL * (expected < 0.0f ? -expected : expected);
           if (abs_diff > thresh) {
             tot_err += 1;
-            // printf("MISMATCH[%lu][%lu]: expected=%f actual=%f diff=%f\r\n",
-            // 	   (unsigned long)buf, (unsigned long)i, expected, actual,
-            // diff);
+            printf("MISMATCH[%lu][%lu]: expected=%f actual=%f diff=%f\r\n",
+            	   (unsigned long)buf, (unsigned long)i, expected, actual,
+            diff);
           }
           if (abs_diff > max_abs_err)
             max_abs_err = abs_diff;
