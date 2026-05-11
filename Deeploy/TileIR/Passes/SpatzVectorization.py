@@ -292,6 +292,14 @@ class SpatzVectorizationPass(TileBindingPass):
                 if loop_var and "idx2" in groups and loop_var in groups.get("idx2", ""):
                     continue
 
+                # Skip vectorization when there are fewer elements than Spatz
+                # cores: integer division yields _vlen=0 and the while-loop
+                # never executes, silently dropping the operation.
+                # ARCH_SPATZ_ATTACED_CORES == 4 at runtime.
+                extent = rep.get("extent", 0)
+                if isinstance(extent, int) and extent < 4:
+                    continue
+
                 if is_flat:
                     b.template = SpatzEltwiseTemplate
                     rep.pop("index_expr", None)
