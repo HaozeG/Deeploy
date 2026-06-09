@@ -376,7 +376,7 @@ TileParallelCoreOpenTemplateStr = r"""
 // ParallelCore: distribute ${loop_var} across cores
 {
     uint32_t core_id = flex_get_core_id();
-    for (uint32_t ${loop_var} = core_id; ${loop_var} < ${extent}; ${loop_var} += ARCH_NUM_CORE_PER_CLUSTER) {
+    for (uint32_t ${loop_var} = core_id; ${loop_var} < ${extent}; ${loop_var} += ARCH_SPATZ_ATTACED_CORES) {
 """
 
 TileParallelCoreOpenTemplate = NodeTemplate(TileParallelCoreOpenTemplateStr)
@@ -475,7 +475,7 @@ SpatzInnerEltwiseTemplateStr = r"""
 // _spatz_attached and _spatz_sid are declared once by SpatzContextTemplate.
 {
     if (_spatz_attached) {
-        uint32_t _vlen = ${extent} / ARCH_SPATZ_ATTACED_CORES;
+        uint32_t _vlen = ${extent};
         uint32_t _addr = (uint32_t)(uintptr_t)${dst}
                          + (${outer_loop_var} * ${dst_stride}) * sizeof(${dtype})
                          + _spatz_sid * _vlen * sizeof(${dtype});
@@ -486,10 +486,6 @@ SpatzInnerEltwiseTemplateStr = r"""
             ${spatz_body}
             _vlen -= _avl;
             _addr += _avl * sizeof(${dtype});
-        }
-    } else {
-        for (uint32_t ${loop_var} = 0; ${loop_var} < ${extent}; ${loop_var}++) {
-            ((${dtype}*)${dst})[${index_expr}] = (${dtype})(${fallback_expr});
         }
     }
 }
