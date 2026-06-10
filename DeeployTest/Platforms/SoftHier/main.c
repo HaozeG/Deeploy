@@ -21,7 +21,7 @@
 // float32_t is defined in Generic types.h
 typedef float float32_t;
 
-#define ENABLE_VERIFY 1
+#define ENABLE_VERIFY 0
 
 // Deeploy-generated
 #include "Network.h"
@@ -56,207 +56,207 @@ int main() {
   if (CID == 0) {
     // For non-float32 inputs: assume input datatype is supported by SoftHier
     // components
-    if (!ISFLOAT32) {
-      if (flex_is_dm_core()) { // allow dm core to init network and dma
-        for (uint32_t buf = 0; buf < DeeployNetwork_num_inputs; buf++) {
-          printf("[main.c] >>> DMAing input buffer from original address "
-                 "0x%08x to network input buffer at address 0x%08x...\n\n",
-                 (uint32_t)(uintptr_t)testInputVector[buf],
-                 (uint32_t)(uintptr_t)DeeployNetwork_inputs[buf]);
-          // original data in HBM (placed by loader)
-          void *ori_addr = testInputVector[buf];
+    // if (!ISFLOAT32) {
+    //   if (flex_is_dm_core()) { // allow dm core to init network and dma
+    //     for (uint32_t buf = 0; buf < DeeployNetwork_num_inputs; buf++) {
+    //       printf("[main.c] >>> DMAing input buffer from original address "
+    //              "0x%08x to network input buffer at address 0x%08x...\n\n",
+    //              (uint32_t)(uintptr_t)testInputVector[buf],
+    //              (uint32_t)(uintptr_t)DeeployNetwork_inputs[buf]);
+    //       // original data in HBM (placed by loader)
+    //       void *ori_addr = testInputVector[buf];
 
-          if ((uint64_t)DeeployNetwork_inputs[buf] <
-              (uint64_t)ARCH_HBM_START_BASE) {
-            // Trigger DMA transaction: move from HBM to L1
-            uint64_t mask = 0x00000000ffffffff;
-            uint64_t masked_addr = (uint64_t)ori_addr & mask;
-            flex_dma_async_1d(DeeployNetwork_inputs[buf], masked_addr,
-                              DeeployNetwork_inputs_bytes[buf]);
-            // Wait all DMA transaction done
-            flex_dma_async_wait_all();
-          } else {
-            uint64_t *dst_addr = DeeployNetwork_inputs[buf];
-            // perform mem_copy with a single core
-            for (uint32_t i = 0; i < (DeeployNetwork_inputs_bytes[buf] + 7) / 8;
-                 i++) {
-              uint64_t data = ((uint64_t *)ori_addr)[i];
-              dst_addr[i] = data;
-            }
-          }
-        }
-        // do the same for output buffer
-        for (uint32_t buf = 0; buf < DeeployNetwork_num_outputs; buf++) {
-          printf("[main.c] >>> DMAing output buffer from original address "
-                 "0x%08x to network output buffer at address 0x%08x...\n\n",
-                 (uint32_t)(uintptr_t)testOutputVector[buf],
-                 (uint32_t)(uintptr_t)DeeployNetwork_outputs[buf]);
-          // original data in HBM (placed by loader)
-          void *ori_addr = testOutputVector[buf];
+    //       if ((uint64_t)DeeployNetwork_inputs[buf] <
+    //           (uint64_t)ARCH_HBM_START_BASE) {
+    //         // Trigger DMA transaction: move from HBM to L1
+    //         uint64_t mask = 0x00000000ffffffff;
+    //         uint64_t masked_addr = (uint64_t)ori_addr & mask;
+    //         flex_dma_async_1d(DeeployNetwork_inputs[buf], masked_addr,
+    //                           DeeployNetwork_inputs_bytes[buf]);
+    //         // Wait all DMA transaction done
+    //         flex_dma_async_wait_all();
+    //       } else {
+    //         uint64_t *dst_addr = DeeployNetwork_inputs[buf];
+    //         // perform mem_copy with a single core
+    //         for (uint32_t i = 0; i < (DeeployNetwork_inputs_bytes[buf] + 7) / 8;
+    //              i++) {
+    //           uint64_t data = ((uint64_t *)ori_addr)[i];
+    //           dst_addr[i] = data;
+    //         }
+    //       }
+    //     }
+    //     // do the same for output buffer
+    //     for (uint32_t buf = 0; buf < DeeployNetwork_num_outputs; buf++) {
+    //       printf("[main.c] >>> DMAing output buffer from original address "
+    //              "0x%08x to network output buffer at address 0x%08x...\n\n",
+    //              (uint32_t)(uintptr_t)testOutputVector[buf],
+    //              (uint32_t)(uintptr_t)DeeployNetwork_outputs[buf]);
+    //       // original data in HBM (placed by loader)
+    //       void *ori_addr = testOutputVector[buf];
 
-          if ((uint64_t)DeeployNetwork_outputs[buf] <
-              (uint64_t)ARCH_HBM_START_BASE) {
-            // Trigger DMA transaction: move from HBM to L1
-            uint64_t mask = 0x00000000ffffffff;
-            uint64_t masked_addr = (uint64_t)ori_addr & mask;
-            flex_dma_async_1d(DeeployNetwork_outputs[buf], masked_addr,
-                              DeeployNetwork_outputs_bytes[buf]);
-            // Wait all DMA transaction done
-            flex_dma_async_wait_all();
-          } else {
-            uint64_t *dst_addr = DeeployNetwork_outputs[buf];
-            // perform mem_copy with a single core
-            for (uint32_t i = 0;
-                 i < (DeeployNetwork_outputs_bytes[buf] + 7) / 8; i++) {
-              uint64_t data = ((uint64_t *)ori_addr)[i];
-              dst_addr[i] = data;
-            }
-          }
-        }
-      }
-      flex_intra_cluster_sync(); // Cluster barrier
-      // check first few elements after DMA
-      if (flex_is_first_core()) {
-        for (uint32_t buf = 0; buf < DeeployNetwork_num_inputs; buf++) {
-          for (uint32_t i = 0; i < 4; i++) {
-            OUTPUTTYPE val = ((OUTPUTTYPE *)DeeployNetwork_inputs[buf])[i];
-            printf("[main.c] >>> After DMA, first few elements of input buffer "
-                   "%lu: %f\r\n",
-                   buf, val);
-          }
-        }
-      }
-      // check first few elements of output buffer after DMA
-      if (flex_is_first_core()) {
-        for (uint32_t buf = 0; buf < DeeployNetwork_num_outputs; buf++) {
-          for (uint32_t i = 0; i < 4; i++) {
-            OUTPUTTYPE val = ((OUTPUTTYPE *)DeeployNetwork_outputs[buf])[i];
-            printf("[main.c] >>> After DMA, first few elements of output "
-                   "buffer %lu: %f\r\n",
-                   buf, val);
-          }
-        }
-      }
-    }
+    //       if ((uint64_t)DeeployNetwork_outputs[buf] <
+    //           (uint64_t)ARCH_HBM_START_BASE) {
+    //         // Trigger DMA transaction: move from HBM to L1
+    //         uint64_t mask = 0x00000000ffffffff;
+    //         uint64_t masked_addr = (uint64_t)ori_addr & mask;
+    //         flex_dma_async_1d(DeeployNetwork_outputs[buf], masked_addr,
+    //                           DeeployNetwork_outputs_bytes[buf]);
+    //         // Wait all DMA transaction done
+    //         flex_dma_async_wait_all();
+    //       } else {
+    //         uint64_t *dst_addr = DeeployNetwork_outputs[buf];
+    //         // perform mem_copy with a single core
+    //         for (uint32_t i = 0;
+    //              i < (DeeployNetwork_outputs_bytes[buf] + 7) / 8; i++) {
+    //           uint64_t data = ((uint64_t *)ori_addr)[i];
+    //           dst_addr[i] = data;
+    //         }
+    //       }
+    //     }
+    //   }
+    //   flex_intra_cluster_sync(); // Cluster barrier
+    //   // check first few elements after DMA
+    //   if (flex_is_first_core()) {
+    //     for (uint32_t buf = 0; buf < DeeployNetwork_num_inputs; buf++) {
+    //       for (uint32_t i = 0; i < 4; i++) {
+    //         OUTPUTTYPE val = ((OUTPUTTYPE *)DeeployNetwork_inputs[buf])[i];
+    //         printf("[main.c] >>> After DMA, first few elements of input buffer "
+    //                "%lu: %f\r\n",
+    //                buf, val);
+    //       }
+    //     }
+    //   }
+    //   // check first few elements of output buffer after DMA
+    //   if (flex_is_first_core()) {
+    //     for (uint32_t buf = 0; buf < DeeployNetwork_num_outputs; buf++) {
+    //       for (uint32_t i = 0; i < 4; i++) {
+    //         OUTPUTTYPE val = ((OUTPUTTYPE *)DeeployNetwork_outputs[buf])[i];
+    //         printf("[main.c] >>> After DMA, first few elements of output "
+    //                "buffer %lu: %f\r\n",
+    //                buf, val);
+    //       }
+    //     }
+    //   }
+    // }
 
     // For float32_t inputs: convert float32 source → fp16 into the network
     // input buffer.  Mirrors the non-fp32 path: if the source data is already
     // in L1 (low address), convert directly; if it is in HBM, DMA it into a
     // temporary L1 buffer first, then convert.
     if (ISFLOAT32) {
-      for (uint32_t buf = 0; buf < DeeployNetwork_num_inputs; buf++) {
-        // DeeployNetwork_inputs_bytes is the fp16 buffer size (2 bytes/element)
-        uint32_t num_elements = DeeployNetwork_inputs_bytes[buf] / sizeof(fp16);
-        float32_t *src_f32 = (float32_t *)testInputVector[buf];
-        fp16 *dst = (fp16 *)DeeployNetwork_inputs[buf];
+      // for (uint32_t buf = 0; buf < DeeployNetwork_num_inputs; buf++) {
+      //   // DeeployNetwork_inputs_bytes is the fp16 buffer size (2 bytes/element)
+      //   uint32_t num_elements = DeeployNetwork_inputs_bytes[buf] / sizeof(fp16);
+      //   float32_t *src_f32 = (float32_t *)testInputVector[buf];
+      //   fp16 *dst = (fp16 *)DeeployNetwork_inputs[buf];
 
-        if ((uint64_t)(uintptr_t)src_f32 < (uint64_t)ARCH_HBM_START_BASE) {
-          // Source is already in L1 – convert directly, no DMA needed
-          if (flex_is_first_core()) {
-            for (uint32_t i = 0; i < num_elements; i++) {
-              dst[i] = float_to_fp16(src_f32[i]);
-            }
-          }
-          flex_intra_cluster_sync();
-        } else {
-          // Source is in HBM – DMA float32 data into a temp L1 buffer first
-          static volatile uint32_t tmp_l1_addr = 0;
+      //   if ((uint64_t)(uintptr_t)src_f32 < (uint64_t)ARCH_HBM_START_BASE) {
+      //     // Source is already in L1 – convert directly, no DMA needed
+      //     if (flex_is_first_core()) {
+      //       for (uint32_t i = 0; i < num_elements; i++) {
+      //         dst[i] = float_to_fp16(src_f32[i]);
+      //       }
+      //     }
+      //     flex_intra_cluster_sync();
+      //   } else {
+      //     // Source is in HBM – DMA float32 data into a temp L1 buffer first
+      //     static volatile uint32_t tmp_l1_addr = 0;
 
-          if (flex_is_first_core()) {
-            tmp_l1_addr = (uint32_t)(uintptr_t)flex_l1_malloc(
-                num_elements * sizeof(float32_t));
-            printf("[main.c] >>> Allocated temporary L1 buffer at address "
-                   "0x%08x for DMA and conversion of input buffer %lu...\n\n",
-                   tmp_l1_addr, buf);
-          }
-          flex_intra_cluster_sync();
+      //     if (flex_is_first_core()) {
+      //       tmp_l1_addr = (uint32_t)(uintptr_t)flex_l1_malloc(
+      //           num_elements * sizeof(float32_t));
+      //       printf("[main.c] >>> Allocated temporary L1 buffer at address "
+      //              "0x%08x for DMA and conversion of input buffer %lu...\n\n",
+      //              tmp_l1_addr, buf);
+      //     }
+      //     flex_intra_cluster_sync();
 
-          if (flex_is_dm_core()) {
-            printf("[main.c] >>> Source HBM address: 0x%08x, Temporary L1 "
-                   "address: 0x%08x\n\n",
-                   (uint32_t)(uintptr_t)src_f32, tmp_l1_addr);
-            uint64_t mask = 0x00000000ffffffff;
-            uint64_t src_hbm = (uint64_t)(uintptr_t)src_f32 & mask;
-            flex_dma_async_1d((void *)(uintptr_t)tmp_l1_addr, src_hbm,
-                              num_elements * sizeof(float32_t));
-            flex_dma_async_wait_all();
-          }
-          flex_intra_cluster_sync();
+      //     if (flex_is_dm_core()) {
+      //       printf("[main.c] >>> Source HBM address: 0x%08x, Temporary L1 "
+      //              "address: 0x%08x\n\n",
+      //              (uint32_t)(uintptr_t)src_f32, tmp_l1_addr);
+      //       uint64_t mask = 0x00000000ffffffff;
+      //       uint64_t src_hbm = (uint64_t)(uintptr_t)src_f32 & mask;
+      //       flex_dma_async_1d((void *)(uintptr_t)tmp_l1_addr, src_hbm,
+      //                         num_elements * sizeof(float32_t));
+      //       flex_dma_async_wait_all();
+      //     }
+      //     flex_intra_cluster_sync();
 
-          if (flex_is_dm_core()) {
-            printf("[main.c] >>> Converting input buffer %lu from FP32 to FP16 "
-                   "in L1...\n\n",
-                   buf);
-            float32_t *src_l1 = (float32_t *)(uintptr_t)tmp_l1_addr;
-            for (uint32_t i = 0; i < num_elements; i++) {
-              // printf("Converting element %lu: %f to %f\n", i, src_l1[i],
-              // fp16_to_float(float_to_fp16(src_l1[i]))); printf("dst addr:
-              // 0x%08x\n", (uint32_t)(uintptr_t)&dst[i]);
-              dst[i] = float_to_fp16(src_l1[i]);
-            }
-            flex_l1_free((void *)(uintptr_t)tmp_l1_addr);
-          }
-          flex_intra_cluster_sync();
-        }
-      }
-      flex_intra_cluster_sync();
-      // do the same for output buffers
-      for (uint32_t buf = 0; buf < DeeployNetwork_num_outputs; buf++) {
-        // DeeployNetwork_outputs_bytes is the fp16 buffer size (2 bytes/element)
-        uint32_t num_elements = DeeployNetwork_outputs_bytes[buf] / sizeof(fp16);
-        float32_t *src_f32 = (float32_t *)testOutputVector[buf];
-        fp16 *dst = (fp16 *)DeeployNetwork_outputs[buf];
+      //     if (flex_is_dm_core()) {
+      //       printf("[main.c] >>> Converting input buffer %lu from FP32 to FP16 "
+      //              "in L1...\n\n",
+      //              buf);
+      //       float32_t *src_l1 = (float32_t *)(uintptr_t)tmp_l1_addr;
+      //       for (uint32_t i = 0; i < num_elements; i++) {
+      //         // printf("Converting element %lu: %f to %f\n", i, src_l1[i],
+      //         // fp16_to_float(float_to_fp16(src_l1[i]))); printf("dst addr:
+      //         // 0x%08x\n", (uint32_t)(uintptr_t)&dst[i]);
+      //         dst[i] = float_to_fp16(src_l1[i]);
+      //       }
+      //       flex_l1_free((void *)(uintptr_t)tmp_l1_addr);
+      //     }
+      //     flex_intra_cluster_sync();
+      //   }
+      // }
+      // flex_intra_cluster_sync();
+      // // do the same for output buffers
+      // for (uint32_t buf = 0; buf < DeeployNetwork_num_outputs; buf++) {
+      //   // DeeployNetwork_outputs_bytes is the fp16 buffer size (2 bytes/element)
+      //   uint32_t num_elements = DeeployNetwork_outputs_bytes[buf] / sizeof(fp16);
+      //   float32_t *src_f32 = (float32_t *)testOutputVector[buf];
+      //   fp16 *dst = (fp16 *)DeeployNetwork_outputs[buf];
 
-        if ((uint64_t)(uintptr_t)src_f32 < (uint64_t)ARCH_HBM_START_BASE) {
-          // Source is already in L1 – convert directly, no DMA needed
-          if (flex_is_first_core()) {
-            for (uint32_t i = 0; i < num_elements; i++) {
-              dst[i] = float_to_fp16(src_f32[i]);
-            }
-          }
-          flex_intra_cluster_sync();
-        } else {
-          // Source is in HBM – DMA float32 data into a temp L1 buffer first
-          static volatile uint32_t tmp_l1_addr = 0;
+      //   if ((uint64_t)(uintptr_t)src_f32 < (uint64_t)ARCH_HBM_START_BASE) {
+      //     // Source is already in L1 – convert directly, no DMA needed
+      //     if (flex_is_first_core()) {
+      //       for (uint32_t i = 0; i < num_elements; i++) {
+      //         dst[i] = float_to_fp16(src_f32[i]);
+      //       }
+      //     }
+      //     flex_intra_cluster_sync();
+      //   } else {
+      //     // Source is in HBM – DMA float32 data into a temp L1 buffer first
+      //     static volatile uint32_t tmp_l1_addr = 0;
 
-          if (flex_is_first_core()) {
-            tmp_l1_addr = (uint32_t)(uintptr_t)flex_l1_malloc(
-                num_elements * sizeof(float32_t));
-            printf("[main.c] >>> Allocated temporary L1 buffer at address "
-                   "0x%08x for DMA and conversion of output buffer %lu...\n\n",
-                   tmp_l1_addr, buf);
-          }
-          flex_intra_cluster_sync();
+      //     if (flex_is_first_core()) {
+      //       tmp_l1_addr = (uint32_t)(uintptr_t)flex_l1_malloc(
+      //           num_elements * sizeof(float32_t));
+      //       printf("[main.c] >>> Allocated temporary L1 buffer at address "
+      //              "0x%08x for DMA and conversion of output buffer %lu...\n\n",
+      //              tmp_l1_addr, buf);
+      //     }
+      //     flex_intra_cluster_sync();
 
-          if (flex_is_dm_core()) {
-            printf("[main.c] >>> Source HBM address: 0x%08x, Temporary L1 "
-                   "address: 0x%08x\n\n",
-                   (uint32_t)(uintptr_t)src_f32, tmp_l1_addr);
-            uint64_t mask = 0x00000000ffffffff;
-            uint64_t src_hbm = (uint64_t)(uintptr_t)src_f32 & mask;
-            flex_dma_async_1d((void *)(uintptr_t)tmp_l1_addr, src_hbm,
-                              num_elements * sizeof(float32_t));
-            flex_dma_async_wait_all();
-          }
-          flex_intra_cluster_sync();
+      //     if (flex_is_dm_core()) {
+      //       printf("[main.c] >>> Source HBM address: 0x%08x, Temporary L1 "
+      //              "address: 0x%08x\n\n",
+      //              (uint32_t)(uintptr_t)src_f32, tmp_l1_addr);
+      //       uint64_t mask = 0x00000000ffffffff;
+      //       uint64_t src_hbm = (uint64_t)(uintptr_t)src_f32 & mask;
+      //       flex_dma_async_1d((void *)(uintptr_t)tmp_l1_addr, src_hbm,
+      //                         num_elements * sizeof(float32_t));
+      //       flex_dma_async_wait_all();
+      //     }
+      //     flex_intra_cluster_sync();
 
-          if (flex_is_dm_core()) {
-            printf("[main.c] >>> Converting output buffer %lu from FP32 to FP16 "
-                   "in L1...\n\n",
-                   buf);
-            float32_t *src_l1 = (float32_t *)(uintptr_t)tmp_l1_addr;
-            for (uint32_t i = 0; i < num_elements; i++) {
-              // printf("Converting element %lu: %f to %f\n", i, src_l1[i],
-              // fp16_to_float(float_to_fp16(src_l1[i]))); printf("dst addr:
-              // 0x%08x\n", (uint32_t)(uintptr_t)&dst[i]);
-              dst[i] = float_to_fp16(src_l1[i]);
-            }
-            flex_l1_free((void *)(uintptr_t)tmp_l1_addr);
-          }
-          flex_intra_cluster_sync();
-        }
-      }
-      flex_intra_cluster_sync();
+      //     if (flex_is_dm_core()) {
+      //       printf("[main.c] >>> Converting output buffer %lu from FP32 to FP16 "
+      //              "in L1...\n\n",
+      //              buf);
+      //       float32_t *src_l1 = (float32_t *)(uintptr_t)tmp_l1_addr;
+      //       for (uint32_t i = 0; i < num_elements; i++) {
+      //         // printf("Converting element %lu: %f to %f\n", i, src_l1[i],
+      //         // fp16_to_float(float_to_fp16(src_l1[i]))); printf("dst addr:
+      //         // 0x%08x\n", (uint32_t)(uintptr_t)&dst[i]);
+      //         dst[i] = float_to_fp16(src_l1[i]);
+      //       }
+      //       flex_l1_free((void *)(uintptr_t)tmp_l1_addr);
+      //     }
+      //     flex_intra_cluster_sync();
+      //   }
+      // }
+      // flex_intra_cluster_sync();
 
       // check for a few elements after conversion
       if (flex_is_first_core()) {

@@ -160,7 +160,7 @@ def compile_tilelang_to_softhier_parallel(
             all_ids.update(ids)
         cluster_ids = sorted(all_ids)
 
-    primfunc = jit_fn.get_tir(*tir_args, **tir_kwargs)
+    primfunc = jit_fn.get_tir(**tir_kwargs)
     ctxt = _make_softhier_ctxt(network_name)
     visitor = TilelangVisitor(
         cluster_policy=cluster_policy,

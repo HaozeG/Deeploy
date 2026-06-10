@@ -386,15 +386,6 @@ class TestEndToEndDpCollective:
             C: T.Tensor((M, N), dtype)
 
             with T.Kernel(T.ceildiv(M, GY_ * BM), T.ceildiv(N, GX_ * BN)) as (by, bx):
-                # 2D cluster layout within one SUMMA instance (GX_ × GY_):
-                #
-                #          local_x →  0    1  …  GX_-1
-                # local_y ↓  0    [ C00  C01  …       ]   diagonal: loads A[row,k], B[k,col]
-                #             1    [ C10  C11  …       ]
-                #             …
-                #
-                # D.broadcast(A, axis="x", root=local_y): row-wise; root = diagonal in that row.
-                # D.broadcast(B, axis="y", root=local_x): col-wise; root = diagonal in that col.
                 with T.cluster_group("summa", x=GX_, y=GY_, num_groups=1,
                                      axes=("x", "y")) as (inst_id, local_x, local_y):
                     A_local = T.alloc_fragment((BM, BK), dtype)
@@ -557,25 +548,28 @@ class TestEndToEndDpCollective:
         cmake_args: list,
     ) -> None:
         """2D SUMMA via D.broadcast: GX=GY=4 (16 clusters), verify C = A @ B."""
-        import tilelang.language as T
         from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
         from deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
         from testUtils.codeGenerate import TilelangIOBuffer, generateTilelangSoftHierTestNetwork
-        from testUtils.core import configure_cmake
+        from testUtils.core import build_binary, configure_cmake, run_simulation
         from testUtils.pytestRunner import create_test_config
 
-        GX, GY = 4, 4
+        GX, GY = 16, 1
         NUM_CLUSTERS = GX * GY
-        M, K, N = 512, 7168, 512
+        M, K, N = 128, 1024, 2048
         BM, BK, BN = 128, 128, 128
         # M, K, N = 256, 256, 256
         # BM, BK, BN = 64, 64, 64
         elem_bytes = 2
 
         summa_gemm_dp = self._build_summa_gemm_dp_kernel(GX=GX, GY=GY)
-        A = T.empty((M, K), T.float16)
-        B = T.empty((K, N), T.float16)
-        C = T.empty((M, N), T.float16)
+
+        rng = np.random.default_rng(42)
+        A_np = (rng.standard_normal((M, K))).astype(np.float16)
+        B_np = (rng.standard_normal((K, N))).astype(np.float16)
+        C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
+        test_in = [A_np, B_np]
+        test_out = [C_ref]
 
         registry = ClusterGroupRegistry([
             ClusterGroup("summa", group_x=GX, group_y=GY, num_groups=1,
@@ -584,7 +578,8 @@ class TestEndToEndDpCollective:
         hw = HardwareBinding({"summa": list(range(NUM_CLUSTERS))})
 
         body = compile_tilelang_to_softhier_parallel(
-            summa_gemm_dp, A, B, C, BM=BM, BN=BN, BK=BK, GX_=GX, GY_=GY,
+            summa_gemm_dp, A_np, B_np,
+            M=M, K=K, N=N, BM=BM, BN=BN, BK=BK, GX_=GX, GY_=GY,
             group_registry=registry,
             hw_binding=hw,
             num_clusters=NUM_CLUSTERS,
@@ -601,24 +596,6 @@ class TestEndToEndDpCollective:
                              nbytes=M * N * elem_bytes, is_input=False),
         ]
 
-        # Skip preloading when the total test data exceeds 5 MB (float32 upcast).
-        # Large tests run with ENABLE_VERIFY=0 so the data is never DMA'd in;
-        # preloading would bloat the binary (.hbm_reserved merges into PROGBITS)
-        # and add simulation overhead for no benefit.
-        _total_preload_bytes = (M * K + K * N + M * N) 
-        _need_verify = _total_preload_bytes < 5 * 1024 * 1024
-        if _need_verify:
-            rng = np.random.default_rng(42)
-            A_np = rng.standard_normal((M, K)).astype(np.float16)
-            B_np = rng.standard_normal((K, N)).astype(np.float16)
-            C_ref = (A_np.astype(np.float32) @ B_np.astype(np.float32)).astype(np.float16)
-            test_in = [A_np, B_np]
-            test_out = [C_ref]
-        else:
-            test_in = None
-            test_out = None
-
-        cmake_extra = list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"]
         config = create_test_config(
             test_name="Tilelang/summa_gemm_dp_2d",
             platform="SoftHier",
@@ -626,7 +603,7 @@ class TestEndToEndDpCollective:
             deeploy_test_dir=deeploy_test_dir,
             toolchain=toolchain,
             toolchain_dir=toolchain_dir,
-            cmake_args=cmake_extra,
+            cmake_args=list(cmake_args) + [f"num_clusters={NUM_CLUSTERS}"],
             tiling=False,
         )
 
@@ -644,7 +621,8 @@ class TestEndToEndDpCollective:
         configure_cmake(config)
         build_binary(config)
         result = run_simulation(config)
-        assert "Simulation stopped by user" in result.stdout, "Simulation did not complete successfully"
+        assert "Simulation stopped by user" in (result.stdout or ""), \
+            "Simulation did not complete successfully"
 
 
 
@@ -762,7 +740,7 @@ class TestEndToEndDpCollective:
         GX, GY, NK0, NK1 = 2, 2, 2, 2
         NG = NK0 * NK1
         NUM_CLUSTERS = GX * GY * NG
-        M, K, N = 512, 7168, 512
+        M, K, N = 128, 7168, 512
         BM, BK, BN = 128, 128, 128
         elem_bytes = 2
 

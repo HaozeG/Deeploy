@@ -293,23 +293,23 @@ class TestMaskedFlashAttnDpE2E:
     def _build_masked_flash_attn_dp_kernel(GX: int = 2):
         import tilelang
         import tilelang.language as T
-
+        # non causal mask version
         @tilelang.jit
-        def masked_flash_attn_dp(Q, K, V, Mask,
+        def masked_flash_attn_dp(H, B, Q, K, V, Mask,
                                   SEQ_: int, D_: int, Bc_: int, GX_: int):
             dtype = T.float16
-            Q: T.Tensor((SEQ_, D_), dtype)
-            K: T.Tensor((SEQ_, D_), dtype)
-            V: T.Tensor((SEQ_, D_), dtype)
-            Mask: T.Tensor((SEQ_, SEQ_), dtype)
-            O = T.empty((SEQ_, D_), dtype)
+            Q: T.Tensor([B, H, SEQ_, D_], dtype)
+            K: T.Tensor([B, H, SEQ_, D_], dtype)
+            V: T.Tensor([B, H, SEQ_, D_], dtype)
+            Mask: T.Tensor([B, H, SEQ_, SEQ_], dtype)
+            O = T.empty([B, H, SEQ_, D_], dtype)
 
             rows_per_cluster = T.ceildiv(SEQ_, GX_)
             Tc = T.ceildiv(SEQ_, Bc_)
 
-            with T.Kernel(1, threads=1) as (bx,):
-                with T.cluster_group("dp", x=GX_, y=1, num_groups=1,
-                                     axes=("x", "y")) as (gid, gid_x, gid_y):
+            with T.Kernel(B, H, threads=1) as (bb, bh):
+                with T.cluster_group("dp", x=GX_, y=1, num_groups=4,
+                                        axes=("x", "y")) as (by, gid_x, gid_y):
                     Q_loc   = T.alloc_fragment((rows_per_cluster, D_), dtype)
                     K_tc    = T.alloc_fragment((Bc_, D_), dtype)
                     V_tc    = T.alloc_fragment((Bc_, D_), dtype)
@@ -317,47 +317,52 @@ class TestMaskedFlashAttnDpE2E:
                     S_loc   = T.alloc_fragment((rows_per_cluster, Bc_), dtype)
                     O_loc   = T.alloc_fragment((rows_per_cluster, D_), dtype)
                     m       = T.alloc_fragment((rows_per_cluster, 1), dtype)
+                    m_old   = T.alloc_fragment((rows_per_cluster, 1), dtype)
                     l       = T.alloc_fragment((rows_per_cluster, 1), dtype)
-                    m_old   = T.alloc_fragment((1,), dtype)
-                    row_sum = T.alloc_fragment((1,), dtype)
+                    row_sum = T.alloc_fragment((rows_per_cluster, 1), dtype)
+                    score_scale = T.alloc_fragment((rows_per_cluster, 1), dtype)
+                    
 
-                    T.copy(Q[gid_x * rows_per_cluster, 0], Q_loc)
+                    T.copy(Q[bb, bh, gid_x * rows_per_cluster, 0], Q_loc)
                     T.clear(O_loc)
 
                     T.clear(m)
                     T.clear(l)
+                    T.clear(m_old)
 
-                    for tc in T.Parallel(Tc):
-                        T.copy(K[tc * Bc_, 0], K_tc)
-                        T.copy(V[tc * Bc_, 0], V_tc)
-                        T.copy(Mask[gid_x * rows_per_cluster, tc * Bc_], Mask_tc)
+                    for tc in T.Serial(Tc):
+                        T.copy(K[bb, bh, tc * Bc_, 0], K_tc)
+                        T.copy(V[bb, bh, tc * Bc_, 0], V_tc)
                         T.clear(S_loc)
                         T.gemm(Q_loc, K_tc, S_loc, transpose_B=True, clear_accum=True)
 
+                        T.clear(row_sum)
+                        T.copy(m, m_old)
+                        T.clear(m)
                         for r in T.Parallel(rows_per_cluster):
-                            for c in T.serial(Bc_):
-                                S_loc[r, c] = T.if_then_else(
-                                    Mask_tc[r, c] > T.float16(0.5),
-                                    S_loc[r, c],
-                                    T.float16(-65504.0)
-                                )
+                            for c in T.Serial(Bc_):
+                                m[r, 0] = T.max(m[r, 0], S_loc[r, c])
+                        for r in T.Parallel(rows_per_cluster):
+                            m[r, 0] = T.max(m[r, 0], m_old[r, 0])
+                        
+                        for r in T.Parallel(rows_per_cluster):
+                            score_scale[r, 0] = T.exp(m_old[r, 0] - m[r, 0])
+                        
+                        for r in T.Parallel(rows_per_cluster):
+                            for c in T.Parallel(Bc_):
+                                S_loc[r, c] = T.exp(S_loc[r, c] - m[r, 0])
 
                         for r in T.Parallel(rows_per_cluster):
-                            m_old[0] = m[r, 0]
-                            for c in T.Parallel(Bc_):
-                                m[r, 0] = T.max(m[r, 0], S_loc[r, c])
-                            T.clear(row_sum)
-                            for c in T.Parallel(Bc_):
-                                S_loc[r, c] = T.if_then_else(
-                                    Mask_tc[r, c] > T.float16(0.5),
-                                    T.exp(S_loc[r, c] - m[r, 0]),
-                                    T.float16(0.0)
-                                )
-                                row_sum[0] = row_sum[0] + S_loc[r, c]
-                            rescale = T.exp(m_old[0] - m[r, 0])
-                            l[r, 0] = l[r, 0] * rescale + row_sum[0]
                             for d in T.Parallel(D_):
-                                O_loc[r, d] = O_loc[r, d] * rescale
+                                O_loc[r, d] = O_loc[r, d] * score_scale[r, 0]
+
+                        # update logsum l
+                        # for r in T.Parallel(rows_per_cluster):
+                        #     T.reduce(S_loc[r, 0:Bc_], row_sum[r, 0], reduce_type='sum', dim=0, clear=False)
+                        for r in T.Parallel(rows_per_cluster):
+                            l[r, 0] = l[r, 0] * score_scale[r, 0]
+                        for r in T.Parallel(rows_per_cluster):
+                            l[r, 0] = l[r, 0] + row_sum[r, 0]
 
                         T.gemm(S_loc, V_tc, O_loc, clear_accum=False)
 
@@ -365,7 +370,8 @@ class TestMaskedFlashAttnDpE2E:
                         for d in T.Parallel(D_):
                             O_loc[r, d] = O_loc[r, d] / l[r, 0]
 
-                    T.copy(O_loc, O[gid_x * rows_per_cluster, 0])
+
+                    T.copy(O_loc, O[bb, bh, gid_x * rows_per_cluster, 0])
 
             return O
 
@@ -385,25 +391,27 @@ class TestMaskedFlashAttnDpE2E:
         from testUtils.core import build_binary, configure_cmake, run_simulation
         from testUtils.pytestRunner import create_test_config
 
-        GX = 16
-        SEQ, D, Bc = 4096, 128, 128
-        # SEQ, D, Bc = 32, 32, 16
-        NUM_CLUSTERS = GX
+        GX = 4
+        B = 1
+        H = 4
+        # SEQ, D, Bc = 4096, 128, 128
+        SEQ, D, Bc = 512, 128, 128
+        NUM_CLUSTERS = 16
         elem_bytes = 2
 
         fn = self._build_masked_flash_attn_dp_kernel(GX=GX)
 
         rng = np.random.default_rng(42)
         scale = np.float16(1.0 / np.sqrt(D))
-        q_np = (rng.standard_normal((SEQ, D)) * scale).astype(np.float16)
-        k_np = (rng.standard_normal((SEQ, D)) * scale).astype(np.float16)
-        v_np = rng.standard_normal((SEQ, D)).astype(np.float16)
-        mask_np = np.tril(np.ones((SEQ, SEQ), dtype=np.float16))
+        q_np = (rng.standard_normal((B, H, SEQ, D)) * scale).astype(np.float16)
+        k_np = (rng.standard_normal((B, H, SEQ, D)) * scale).astype(np.float16)
+        v_np = rng.standard_normal((B, H, SEQ, D)).astype(np.float16)
+        mask_np = np.tril(np.ones((B, H, SEQ, SEQ), dtype=np.float16))
 
         q_f32 = q_np.astype(np.float32)
         k_f32 = k_np.astype(np.float32)
         v_f32 = v_np.astype(np.float32)
-        scores = q_f32 @ k_f32.T
+        scores = q_f32 @ k_f32.transpose(0, 1, 3, 2)
         scores = np.where(mask_np > 0.5, scores, -1e9)
         scores -= np.max(scores, axis=1, keepdims=True)
         exp_s = np.exp(scores)
@@ -414,11 +422,11 @@ class TestMaskedFlashAttnDpE2E:
             ClusterGroup("dp", group_x=GX, group_y=1, num_groups=1,
                          axis_names=("x", "y"))
         ])
-        hw = HardwareBinding({"dp": list(range(GX))})
+        hw = HardwareBinding({"dp": list(range(NUM_CLUSTERS))})
 
         body = compile_tilelang_to_softhier_parallel(
             fn, q_np, k_np, v_np, mask_np,
-            SEQ_=SEQ, D_=D, Bc_=Bc, GX_=GX,
+            H = H, B=B, SEQ_=SEQ, D_=D, Bc_=Bc, GX_=GX,
             group_registry=registry,
             hw_binding=hw,
             num_clusters=NUM_CLUSTERS,
@@ -672,11 +680,11 @@ class TestFlashMLAE2E:
                     T.copy(Q_pe[gid_x * heads_per_cluster, 0], Q_pe_loc)
                     T.clear(O_loc)
 
-                    for h in T.serial(heads_per_cluster):
+                    for h in T.Parallel(heads_per_cluster):
                         m[h, 0] = T.float16(-65504.0)
                         l[h, 0] = T.float16(0.0)
 
-                    for tc in T.serial(Tc):
+                    for tc in T.Pipelined(Tc, num_stages=2):
                         T.copy(KV[tc * Bc_, 0], KV_tc)
                         T.copy(K_pe[tc * Bc_, 0], K_pe_tc)
                         T.clear(S_loc)
@@ -694,13 +702,13 @@ class TestFlashMLAE2E:
                                 row_sum[0] = row_sum[0] + S_loc[h, c]
                             rescale = T.exp(m_old[0] - m[h, 0])
                             l[h, 0] = l[h, 0] * rescale + row_sum[0]
-                            for d in T.serial(D_):
+                            for d in T.Parallel(D_):
                                 O_loc[h, d] = O_loc[h, d] * rescale
 
                         T.gemm(S_loc, KV_tc, O_loc, clear_accum=False)
 
-                    for h in T.serial(heads_per_cluster):
-                        for d in T.serial(D_):
+                    for h in T.Parallel(heads_per_cluster):
+                        for d in T.Parallel(D_):
                             O_loc[h, d] = O_loc[h, d] / l[h, 0]
 
                     T.copy(O_loc, O[gid_x * heads_per_cluster, 0])
@@ -726,8 +734,8 @@ class TestFlashMLAE2E:
         from testUtils.core import build_binary, configure_cmake, run_simulation
         from testUtils.pytestRunner import create_test_config
 
-        GX = 2
-        H, D, pe_dim, SEQ, Bc = 64, 32, 32, 64, 32
+        GX = 16
+        H, D, pe_dim, SEQ, Bc = 128, 512, 64, 1024, 128
         NUM_CLUSTERS = GX
         elem_bytes = 2
 

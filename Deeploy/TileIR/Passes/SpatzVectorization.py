@@ -29,6 +29,28 @@ from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import (
 from Deeploy.TileIR.IR.TileBinding import TileBinding, TileOpKind
 from Deeploy.TileIR.Passes.Base import TileBindingPass
 
+_OUTER_OFFSET_RE = re.compile(
+    r'^\(?\s*(?P<outer>\w+)\s*\*\s*(?P<stride>\d+)\s*\)?\s*\+\s*'
+    r'(?P<inner>\w+)$'
+)
+
+
+def _outer_offset(index_expr: str, loop_var: str):
+    """Parse a linearised 2-D index ``outer * stride + inner`` where
+    ``inner == loop_var``.  Returns ``(outer_var, stride)`` when the
+    pattern matches and ``inner`` equals ``loop_var``; otherwise
+    ``(None, 1)``.
+
+    This detects the case where a flat ``T.Parallel(inner)`` is nested
+    inside a serialised outer loop over ``outer``: the Spatz address must
+    include an ``outer * stride`` row offset, otherwise every iteration
+    of the outer loop overwrites the same buffer slice.
+    """
+    m = _OUTER_OFFSET_RE.match(index_expr.strip())
+    if m and m.group("inner") == loop_var:
+        return m.group("outer"), int(m.group("stride"))
+    return None, 1
+
 
 class SpatzVectorizationPass(TileBindingPass):
     """Replace scalar eltwise bindings with Spatz vector equivalents."""
@@ -284,6 +306,14 @@ class SpatzVectorizationPass(TileBindingPass):
                 m = pattern.search(src_expr)
                 if not m:
                     continue
+                # Safety: the pattern must match at the start of src_expr.
+                # Without this, sub-expression matches occur in expressions like
+                # "S_loc[i] / exp(m_old[r] - m[r])" where the exp_sub pattern
+                # finds tile_fp16_exp(...) inside the denominator, misidentifying
+                # m_old (a 64-element scalar-per-row buffer) as a vector to load
+                # from and producing out-of-bounds reads / wrong computation.
+                if m.start() != 0:
+                    continue
                 groups = m.groupdict()
                 # Safety: vf rules capture idx2 (scalar buffer index).  Skip
                 # the rule when idx2 contains the eltwise loop variable -- that
@@ -301,8 +331,33 @@ class SpatzVectorizationPass(TileBindingPass):
                     continue
 
                 if is_flat:
-                    b.template = SpatzEltwiseTemplate
-                    rep.pop("index_expr", None)
+                    # Detect when the flat eltwise is actually an inner loop
+                    # serialised from an outer T.Parallel that fell back to a
+                    # serial for-loop.  index_expr of the form "r * stride + d"
+                    # reveals an outer loop variable r that must be used as a
+                    # row offset; without it the Spatz address always starts at
+                    # the buffer base (row 0) regardless of r, so every r
+                    # iteration overwrites the same row.
+                    outer_loop_var, dst_stride = _outer_offset(
+                        rep.get("index_expr", loop_var) or loop_var, loop_var
+                    )
+                    if outer_loop_var is not None:
+                        # Switch to SpatzInnerEltwiseTemplate so _addr and
+                        # _addr_src get the (outer_loop_var * dst_stride) prefix.
+                        row_prefix = (
+                            f"({outer_loop_var} * {dst_stride}) * sizeof(fp16) + "
+                        )
+                        spatz_setup = spatz_setup.replace(
+                            "_spatz_sid * _vlen * sizeof(fp16)",
+                            row_prefix + "_spatz_sid * _vlen * sizeof(fp16)",
+                        )
+                        rep["outer_loop_var"] = outer_loop_var
+                        rep["dst_stride"]     = dst_stride
+                        b.template = SpatzInnerEltwiseTemplate
+                        # Keep index_expr — used by the fallback else-branch.
+                    else:
+                        b.template = SpatzEltwiseTemplate
+                        rep.pop("index_expr", None)
                 else:
                     # Inject row offset into every _addr_src produced by the rule.
                     # All rules use "_spatz_sid * _vlen * sizeof(fp16)" as the
@@ -311,7 +366,7 @@ class SpatzVectorizationPass(TileBindingPass):
                     outer_loop_var = rep.get("outer_loop_var", "")
                     dst_stride     = rep.get("dst_stride", 1)
                     row_prefix = (
-                        f"({outer_loop_var} * {dst_stride}) * sizeof(fp16) + "
+                        f"({outer_loop_var} * {dst_stride} * ARCH_SPATZ_ATTACED_CORES) * sizeof(fp16) + "
                     )
                     spatz_setup = spatz_setup.replace(
                         "_spatz_sid * _vlen * sizeof(fp16)",
