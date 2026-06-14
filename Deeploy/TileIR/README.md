@@ -4,16 +4,16 @@
 
 ```bash
 # 1. Source SoftHier toolchain paths (adjust to softhier_ if using that clone)
-source /home/haoze/softhier/sourceme.sh
+source /your/path/to/softhier/sourceme.sh
 
-# 2. Activate Deeploy conda environment (sets Python paths)
+# 2. Activate your conda environment(for example named as Deeploy) (and sets Python paths)
 conda activate Deeploy
 
 # 3. Install Deeploy (if not already installed)
 pip install -e /home/haoze/Deeploy
 
-# 4. Install TileLang external repo (provides T.cluster_group, T.Pipelined, D.* base)
-cd /home/haoze/codebase/tilelang/tilelang && pip install -e .
+# 4. Install TileLang external repo (provides T.cluster_group, D.* base)
+cd /your/path/to/tilelang && pip install -e .
 ```
 
 Running e2e tests:
@@ -28,6 +28,8 @@ pytest test_tilelang_attention.py -v -s -m "tilelang and softhier" \
 Key external source files (in `/home/haoze/codebase/tilelang/tilelang/tilelang/language/`):
 - `cluster_group.py` — `T.cluster_group` context manager
 - `collective_op.py` — `T.allreduce`, `T.broadcast` native TileLang primitives
+
+> see repo link [Github Tilelang for SoftHier](https://github.com/HaozeG/tilelang-softhier)
 
 ## What lives where
 
