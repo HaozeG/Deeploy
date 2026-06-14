@@ -121,6 +121,13 @@ The following exist in `tl_deeploy.py` with visitor handlers but are **not e2e t
 - `T.allreduce`, `T.broadcast`, `T.group_shift`, `T.group_bcast_axis` — native TileLang
   collective ops routed through untested CollectiveStrategies (see Known limitations)
 
+### Reference E2E kernels
+
+test_summa_gemm_dp_2d_e2e, test_summa_gemm_dp_split_k_e2e, test_summa_gemm_dp_split_k2d_e2e at DeeployTest/test_tilelang_gemm.py
+test_masked_flash_attn_dp_e2e at DeeployTest/test_tilelang_attention.py
+
+can ignore redundant tests in other `DeeployTest/test_tilelang_*.py` files.
+
 ### Example (SUMMA GEMM pattern)
 
 ```python
