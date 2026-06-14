@@ -23,9 +23,10 @@ macro(add_gvsoc_emulation name)
             --target=pulp.chips.flex_cluster.flex_cluster
             --binary ${BINARY_PATH}
             run
-            # ${PRELOAD_ARG}
+            ${PRELOAD_ARG}
             # --trace-level=6 --trace=/chip/cluster_0/pe0/insn
-            --trace=redmule --trace=idma --trace=spatz --trace=cluster_registers
+            --trace=redmule --trace=idma --trace=cluster_registers
+            # --trace=redmule --trace=idma --trace=spatz --trace=cluster_registers
             # --trace=/chip/cluster_0/redmule
             # --trace=/chip/cluster_0/idma
             # --trace=/chip/cluster_0/pe0/insn
