@@ -323,18 +323,6 @@ class TestCollectiveOpSpec:
         assert spec.reduce_op == "max"
 
 
-class TestShardMetadata:
-    def test_defaults(self):
-        from Deeploy.TileIR.IR import ShardMetadata
-        m = ShardMetadata()
-        assert m.group_id is None
-
-    def test_fields(self):
-        from Deeploy.TileIR.IR import ShardMetadata
-        m = ShardMetadata(group_id="tp_row")
-        assert m.group_id == "tp_row"
-
-
 # ---------------------------------------------------------------------------
 # Tests: SoftHierCollectiveBackend lowering
 # ---------------------------------------------------------------------------
@@ -498,16 +486,14 @@ class TestCollectiveBinding:
 
 class TestGroupAwareBarrierPass:
     def _make_binding(self, cluster_id, group_id=None):
-        from Deeploy.TileIR.IR import ShardMetadata
         from Deeploy.TileIR.Midend.TileBindings import TileBinding
         from Deeploy.DeeployTypes import NodeTemplate
-        shard_meta = ShardMetadata(group_id=group_id) if group_id else None
         return TileBinding(
             op_kind="load",
             template=NodeTemplate("// op\n"),
             operator_representation={
                 "cluster_id": cluster_id,
-                "shard_metadata": shard_meta,
+                "shard_group_id": group_id,
             },
         )
 
@@ -541,7 +527,6 @@ class TestCollectiveLoweringPass:
             CollectiveLoweringPass,
             CollectiveOpSpec,
             HardwareBinding,
-            ShardMetadata,
             SoftHierCollectiveBackend,
         )
         from Deeploy.TileIR.Midend.TileBindings import TileBinding
@@ -552,11 +537,10 @@ class TestCollectiveLoweringPass:
         hw = HardwareBinding({"tp": [0, 1]})
         backend = SoftHierCollectiveBackend()
 
-        shard = ShardMetadata(group_id="tp")
         load_b = TileBinding(
             op_kind="load",
             template=NodeTemplate("// load\n"),
-            operator_representation={"cluster_id": 0, "shard_metadata": shard},
+            operator_representation={"cluster_id": 0, "shard_group_id": "tp"},
         )
 
         spec = CollectiveOpSpec(op="allreduce", group_id="tp",
@@ -565,7 +549,7 @@ class TestCollectiveLoweringPass:
             op_kind="group_collective",
             template=NodeTemplate("// placeholder\n"),
             operator_representation={
-                "cluster_id": None, "shard_metadata": shard, "nbytes": 128,
+                "cluster_id": None, "shard_group_id": "tp", "nbytes": 128,
             },
             spec=spec,
         )
@@ -736,7 +720,7 @@ class TestTPGemmCompilation:
             tp_gemm, A, B, C, BM=BM, BN=BN, BK=BK,
             group_registry=registry,
             hw_binding=hw_binding,
-            cluster_policy="block_idx",
+            use_block_idx=True,
             cluster_ids=[0, 1],
         )
         assert isinstance(code, str)
@@ -769,7 +753,7 @@ class TestTPGemmCompilation:
             tp_gemm, A, B, C, BM=BM, BN=BN, BK=BK,
             group_registry=registry,
             hw_binding=hw_binding,
-            cluster_policy="block_idx",
+            use_block_idx=True,
             cluster_ids=[0, 1],
         )
         assert "grid_sync_group_init" in code
@@ -813,7 +797,7 @@ class TestTPGemmCompilation:
             tp_gemm, A, B, C, BM=BM, BN=BN, BK=BK,
             group_registry=registry,
             hw_binding=hw_binding,
-            cluster_policy="block_idx",
+            use_block_idx=True,
             num_clusters=16,
         )
         # Block K-split: loop bounds derived from cluster rank * tiles_per_rank
@@ -1016,7 +1000,7 @@ class TestTIRStructure:
             structBuffer=SoftHierDynamicBuffer,
             transientBuffer=SoftHierDynamicBuffer,
         )
-        visitor = TilelangVisitor(cluster_policy="block_idx", cluster_ids=[0, 1])
+        visitor = TilelangVisitor(use_block_idx=True, cluster_ids=[0, 1])
         pipeline = visitor.visit_bindings(primfunc, ctxt)
         ctxt, eb = pipeline.codeTransform(ctxt)
         code = eb.generate(ctxt)

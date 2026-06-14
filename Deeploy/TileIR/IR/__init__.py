@@ -9,7 +9,6 @@ from Deeploy.TileIR.IR.CollectivePrimitives import (
     ClusterGroup,
     ClusterGroupRegistry,
     CollectiveOpSpec,
-    ShardMetadata,
     TensorLayout,
 )
 from Deeploy.TileIR.IR.HardwareBinding import (
@@ -36,7 +35,6 @@ __all__ = [
     "ClusterGroup",
     "ClusterGroupRegistry",
     "CollectiveOpSpec",
-    "ShardMetadata",
     "TensorLayout",
     "HardwareBinding",
     "HwTopology",

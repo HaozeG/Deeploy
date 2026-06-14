@@ -554,12 +554,12 @@ class TestEndToEndDpCollective:
         from testUtils.core import build_binary, configure_cmake, run_simulation
         from testUtils.pytestRunner import create_test_config
 
-        GX, GY = 16, 1
+        GX, GY = 4, 4
         NUM_CLUSTERS = GX * GY
-        M, K, N = 128, 1024, 2048
-        BM, BK, BN = 128, 128, 128
-        # M, K, N = 256, 256, 256
-        # BM, BK, BN = 64, 64, 64
+        # M, K, N = 128, 1024, 2048
+        # BM, BK, BN = 128, 128, 128
+        M, K, N = 256, 256, 256
+        BM, BK, BN = 64, 64, 64
         elem_bytes = 2
 
         summa_gemm_dp = self._build_summa_gemm_dp_kernel(GX=GX, GY=GY)

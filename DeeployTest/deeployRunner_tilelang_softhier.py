@@ -110,7 +110,7 @@ def compile_tilelang_to_softhier_parallel(
     group_registry: ClusterGroupRegistry,
     hw_binding: HardwareBinding,
     backend: Optional[CollectiveBackend] = None,
-    cluster_policy: str = "hybrid",
+    use_block_idx: bool = False,
     num_clusters: Optional[int] = None,
     cluster_ids: Optional[List[int]] = None,
     network_name: str = "DeeployNetwork",
@@ -133,13 +133,12 @@ def compile_tilelang_to_softhier_parallel(
         Physical cluster-ID mapping for the groups.
     backend : Optional[CollectiveBackend]
         Hardware collective backend.  Defaults to ``SoftHierCollectiveBackend``.
-    cluster_policy : str
-        Cluster assignment policy for ``TilelangVisitor``.  One of
-        ``"explicit_attr"``, ``"block_idx"``, or ``"hybrid"`` (default).
+    use_block_idx : bool
+        When True, infer cluster from block indices when no explicit cluster_id
+        annotation is present.  Default False.
     num_clusters : Optional[int]
         Number of physical clusters for modulo mapping from block id to
-        cluster id.  Used when ``cluster_policy`` includes block-index
-        inference.
+        cluster id.  Used when ``use_block_idx`` is True.
     network_name : str
         Used for C symbol mangling (default ``'DeeployNetwork'``).
     **tir_kwargs :
@@ -163,7 +162,7 @@ def compile_tilelang_to_softhier_parallel(
     primfunc = jit_fn.get_tir(**tir_kwargs)
     ctxt = _make_softhier_ctxt(network_name)
     visitor = TilelangVisitor(
-        cluster_policy=cluster_policy,
+        use_block_idx=use_block_idx,
         num_clusters=num_clusters,
         cluster_ids=cluster_ids,
         group_registry=group_registry,

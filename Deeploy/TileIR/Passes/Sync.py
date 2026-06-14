@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from Deeploy.DeeployTypes import NodeTemplate
-from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import TileSyncTemplate
 from Deeploy.TileIR.IR.TileBinding import (
     _BARRIER_TRANSPARENT_OP_KINDS,
     _GLOBAL_CLUSTER_SWITCH_BARRIER_TEMPLATE,
@@ -20,6 +19,7 @@ from Deeploy.TileIR.IR.TileBinding import (
 from Deeploy.TileIR.Passes.Base import (
     _GLOBAL_BARRIER_TEMPLATE,
     _INTRA_CLUSTER_SYNC_TEMPLATE,
+    _is_intra_cluster_sync,
     TileBindingPass,
 )
 
@@ -109,10 +109,7 @@ class GroupAwareBarrierPass(TileBindingPass):
 
             rep = binding.operator_representation
             current_cluster_id = rep.get("cluster_id", None)
-            shard_meta = rep.get("shard_metadata", None)
-            current_group_id: Optional[str] = (
-                shard_meta.group_id if shard_meta is not None else None
-            )
+            current_group_id: Optional[str] = rep.get("shard_group_id")
 
             if prev_seen:
                 if current_cluster_id != prev_cluster_id:
@@ -150,15 +147,10 @@ class DedupSyncPass(TileBindingPass):
     """
 
     def apply(self, bindings: List[TileBinding]) -> List[TileBinding]:
-        intra_sync_templates = {TileSyncTemplate, _INTRA_CLUSTER_SYNC_TEMPLATE}
-
-        def _is_intra_sync(b: TileBinding) -> bool:
-            return b.op_kind == "sync" and b.template in intra_sync_templates
-
         result: List[TileBinding] = []
         prev_was_intra_sync = False
         for b in bindings:
-            cur_is_intra_sync = _is_intra_sync(b)
+            cur_is_intra_sync = _is_intra_cluster_sync(b)
             if cur_is_intra_sync and prev_was_intra_sync:
                 continue
             result.append(b)

@@ -23,9 +23,6 @@ TensorLayout
 
 CollectiveOpSpec
     Math-level specification of an inter-cluster collective operation.
-
-ShardMetadata
-    Lightweight per-binding metadata tag for tile-reuse analysis passes.
 """
 
 from __future__ import annotations
@@ -292,13 +289,6 @@ class CollectiveOpSpec:
     level: Optional[str] = None
     axis: Optional[str] = None
     root_expr: str = ""
-
-
-@dataclass
-class ShardMetadata:
-    """Lightweight per-TileBinding metadata for tile-reuse analysis."""
-
-    group_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

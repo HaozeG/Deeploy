@@ -29,6 +29,5 @@ class CollectiveBinding(TileBinding):
     spec: Optional["CollectiveOpSpec"] = None
 
     def __post_init__(self) -> None:
-        if self.op_kind != "group_collective":
-            self.op_kind = TileOpKind.group_collective
+        self.op_kind = TileOpKind.group_collective
         super().__post_init__()

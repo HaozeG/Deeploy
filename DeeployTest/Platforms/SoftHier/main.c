@@ -21,7 +21,7 @@
 // float32_t is defined in Generic types.h
 typedef float float32_t;
 
-#define ENABLE_VERIFY 0
+#define ENABLE_VERIFY 1
 
 // Deeploy-generated
 #include "Network.h"

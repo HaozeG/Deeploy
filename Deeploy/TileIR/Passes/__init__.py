@@ -16,8 +16,6 @@ from Deeploy.TileIR.Passes.Sync import (
     GlobalClusterBarrierPass,
     GroupAwareBarrierPass,
 )
-from Deeploy.TileIR.Passes.WorkPartitioning import WorkPartitioningPass
-
 __all__ = [
     "TileBindingPass",
     "SoftwarePipelinePass",
@@ -27,5 +25,4 @@ __all__ = [
     "DedupSyncPass",
     "HoistAllocFreePass",
     "CollectiveLoweringPass",
-    "WorkPartitioningPass",
 ]

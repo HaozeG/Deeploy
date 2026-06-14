@@ -1,18 +1,69 @@
-# Tilelang for SoftHier based on Deeploy
+# TileIR — TileLang → SoftHier compiler extension
 
-## DSL Extension
+## What lives where
 
-> `TileIR/Frontend/tl_deeploy.py`
-> `tilelang/tilelang/language/cluster_group.py`
+| Component | File |
+|-----------|------|
+| DSL ops (`D.*`) | `Deeploy/TileIR/Frontend/tl_deeploy.py` |
+| `T.cluster_group` | **external repo** `tilelang/tilelang/language/cluster_group.py` |
+| Frontend visitor | `Deeploy/TileIR/Frontend/TilelangVisitor.py` |
+| IR primitives | `Deeploy/TileIR/IR/CollectivePrimitives.py`, `HardwareBinding.py` |
+| Passes | `Deeploy/TileIR/Passes/` |
+| C templates | `Deeploy/TileIR/Backend/Templates/` |
 
-### Usage example:
+## Quickstart: compiling a kernel
+
+```python
+from DeeployTest.deeployRunner_tilelang_softhier import compile_tilelang_to_softhier_parallel
+from Deeploy.TileIR.IR import ClusterGroup, ClusterGroupRegistry, HardwareBinding
+
+# Declare logical cluster groups
+registry = ClusterGroupRegistry([
+    ClusterGroup("summa", group_x=GX, group_y=GY)
+])
+# Map group name → physical cluster IDs
+hw = HardwareBinding({"summa": list(range(GX * GY))})
+
+c_code = compile_tilelang_to_softhier_parallel(
+    jit_fn,
+    group_registry=registry,
+    hw_binding=hw,
+    num_clusters=GX * GY,
+)
+```
+
+## DSL ops
+
+Import with:
+```python
+from Deeploy.TileIR.Frontend import tl_deeploy as D
+```
+
+### `D.broadcast(buf, level, axis, group, root)`
+
+Broadcast `buf` from root rank to all other ranks in the group.
+
+- `level`: `"intra_group"` (within one group instance) or `"inter_group"` (across instances)
+- `axis`: axis name to broadcast along (required for 2-D groups; `""` for 1-D)
+- `group`: `ClusterGroup` name (string)
+- `root`: C expression for source rank (e.g. `"local_y"`, `"0"`)
+
+### `D.reduce(buf, op, level, axis, group, root)`
+
+Reduce `buf` in-place across all ranks.
+
+- `op`: `"sum"` | `"max"` | `"min"` | `"prod"`
+- `level`, `axis`, `group`, `root`: same semantics as `D.broadcast`; `root=""` → allreduce
+
+### Example (SUMMA GEMM pattern)
+
 ```python
 import tilelang
 import tilelang.language as T
 from Deeploy.TileIR.Frontend import tl_deeploy as D
 
 @tilelang.jit
-def summa_gemm_dp(A, B, C, BM: int, BN: int, BK: int, GX_: int, GY_: int):
+def summa_gemm(A, B, C, BM: int, BN: int, BK: int, GX_: int, GY_: int):
     M, K, N = T.const("M, K, N")
     dtype = T.float16
     A: T.Tensor((M, K), dtype)
@@ -21,7 +72,7 @@ def summa_gemm_dp(A, B, C, BM: int, BN: int, BK: int, GX_: int, GY_: int):
 
     with T.Kernel(T.ceildiv(M, GY_ * BM), T.ceildiv(N, GX_ * BN)) as (by, bx):
         with T.cluster_group("summa", x=GX_, y=GY_, num_groups=1,
-                                axes=("x", "y")) as (inst_id, local_x, local_y):
+                              axes=("x", "y")) as (inst_id, local_x, local_y):
             A_local = T.alloc_fragment((BM, BK), dtype)
             B_local = T.alloc_fragment((BK, BN), dtype)
             C_local = T.alloc_fragment((BM, BN), dtype)
@@ -38,183 +89,43 @@ def summa_gemm_dp(A, B, C, BM: int, BN: int, BK: int, GX_: int, GY_: int):
                 T.gemm(A_local, B_local, C_local, clear_accum=False)
 
             T.copy(C_local, C[(by * GY_ + local_y) * BM, (bx * GX_ + local_x) * BN])
-
-
-```
-`from Deeploy.TileIR.Frontend import tl_deeploy as D`. Use `D.` to differentiate from Tilelang's native primitives.
-
-### Workflow for adding a new op:
-
-1. Register in TVM op registry: `tvm.ir.register_op_attr(_op_name, "TCallEffectKind", tir.CallEffectKind.Opaque)`
-2. Frontend validation helpers: `_check_reduce_args`, `_check_broadcast_args`
-3. API for programmer to write as `D.func()`: define function, validate inputs, emit TVM op `tir.call_intrin("handle", ...)`
-4. Use `jit_func.get_tir()` to get Tilelang AST: see function `compile_tilelang_to_softhier_parallel`
-
-### Ops
-Tested ops:
-
-```python
-D.reduce(buffer, level, axis, group, root)
-D.broadcast()
-
 ```
 
-Untested proposed ops:
-```python
-D.sync_grid() # sync with global barrier
-# could use for debugging
-D.device_assert()
+## Required parameters for `compile_tilelang_to_softhier_parallel`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `group_registry` | `ClusterGroupRegistry` | Declares cluster groups (shape, axes) |
+| `hw_binding` | `HardwareBinding` | Maps group name → physical cluster IDs |
+| `num_clusters` | `int` | Total physical clusters on the SoC |
+
+Optional:
+- `use_block_idx: bool` — infer cluster from block indices when no explicit `T.attr(..., "cluster_id", ...)` is present (default `False`)
+- `backend` — collective backend, defaults to `SoftHierCollectiveBackend`
+
+## Compilation pipeline
+
+Passes run in this order after the visitor:
+
+```
+SoftwarePipelinePass → HoistAllocFreePass → SpatzVectorizationPass
+→ GroupAwareBarrierPass → CollectiveLoweringPass → DedupSyncPass
 ```
 
-## Compiler
+The visitor (`TilelangVisitor`) emits `TileBinding` objects tagged with `shard_group_id` (a plain string naming the enclosing cluster group). The passes use this tag to insert barriers and lower collectives correctly.
 
-> The definition of IR here is negotiable. Current design might not be clean and extensible
+## How to add a new op
 
-Extend with Deeploy's original workflow. Compilation flow as below:
+1. **Register in TVM op registry** (`tl_deeploy.py`):
+   ```python
+   tvm.ir.register_op_attr(_op_name, "TCallEffectKind", tir.CallEffectKind.Opaque)
+   ```
+2. **Add validation helper** (optional): `_check_<op>_args(...)`.
+3. **Expose as `D.<op>()`**: validate inputs, emit `tir.call_intrin("handle", ...)`.
+4. **Add visitor handler** in `TilelangVisitor`:
+   - Register in `self._supported_ops` dict (key = last `.`-segment of intrinsic name).
+   - Implement `_handle_<op>(self, args, cluster_id)`.
+   - Parse buffers via `self._region_buf_name(args[i])` or `str(args[i]).strip('"')`.
+   - Emit via `self._emit_binding(op_kind, Template, rep)` or `_emit_collective_binding(...)`.
 
-- Function decorated with `@tilelang.jit`
-- Get Tilelang AST with `.get_tir()`
-- Create frontend visitor `TilelangVisitor` with hardware infos (lastest version remove this requirement, but rely on `cluster_group` info from Tilelang AST. I think for a complete mapping from logical cluster to physical cluster, here we need to register physical cluster configs with visitor emitted IRs)
-- *Frontend*: Visit Tilelang AST with `TilelangVisitor` and emit `TileBindingPipeline` as a list of `TileBinding` (extended from Deeploy's Bindings) and context (extended from Deeploy's `NetworkContext`)
-- *Midend*: Apply optimization passes with `tilebinding.codeTransform(ctxt)` to get ordered list of `ExecutionBlock`, update information in `NetworkContext` ctxt
-- *Backend*: Generate code from `NetworkContext` and `ExecutionBlock`
-
-Tilelang AST -> TileBinding -> ExecutionBlock + NetworkContext -> code
-
-Core IR is `TileBinding`. Recorded information as below:
-- Category of IR: MEMORY/COMPUTE/CONTROL_FLOW/SYNC/COLLECTIVE/MISC. 
-    - used for software pipeline pass to recognize COMPUTE/COMMUNICATION.
-- OpKind: semantic operation kind
-    - for example, alloc, free, load, gemm, for_open, for_close
-- Code template `NodeTemplate`
-    - reused from Deeploy. Mako templates
-- code_transformer `CodeTransformation`
-    - reused from Deeploy. as a pass applied to a single `ExecutionBlock`
-    - Here only has per-op transformations, inter-op transformations recorded in `TileBindingPipeline`
-
-Special IR for collectives `CollectiveBinding`:
-- Consider it heavily relies on `cluster_group` informations, here deals with it separately
-    - For other IRs, information like physical cluster assignments can just be a list of cluster ids
-
-> But I think this can be simplified or unified, if not reusing Deeploy's design. Now, only the overall IR design (what is stored in IR) is borrowed from Deeploy, but Frontend, Midend, Backend all did not follow Deeploy's design.
-
-Detailed example as below:
-```python
-def compile_tilelang_to_softhier_parallel(
-    jit_fn,
-    *tir_args,
-    group_registry: ClusterGroupRegistry,
-    hw_binding: HardwareBinding,
-    backend: Optional[CollectiveBackend] = None,
-    cluster_policy: str = "hybrid",
-    num_clusters: Optional[int] = None,
-    cluster_ids: Optional[List[int]] = None,
-    network_name: str = "DeeployNetwork",
-    **tir_kwargs,
-) -> str:
-    """Compile a TileLang jit function with cluster-group collective support.
-
-    Extends ``compile_tilelang_to_softhier`` with group-aware barrier insertion
-    and collective lowering.
-
-    Parameters
-    ----------
-    jit_fn :
-        A ``@tilelang.jit``-decorated function with a ``.get_tir()`` method.
-    *tir_args :
-        Positional arguments forwarded to ``jit_fn.get_tir()``.
-    group_registry : ClusterGroupRegistry
-        Declared cluster groups.
-    hw_binding : HardwareBinding
-        Physical cluster-ID mapping for the groups.
-    backend : Optional[CollectiveBackend]
-        Hardware collective backend.  Defaults to ``SoftHierCollectiveBackend``.
-    cluster_policy : str
-        Cluster assignment policy for ``TilelangVisitor``.  One of
-        ``"explicit_attr"``, ``"block_idx"``, or ``"hybrid"`` (default).
-    num_clusters : Optional[int]
-        Number of physical clusters for modulo mapping from block id to
-        cluster id.  Used when ``cluster_policy`` includes block-index
-        inference.
-    network_name : str
-        Used for C symbol mangling (default ``'DeeployNetwork'``).
-    **tir_kwargs :
-        Keyword arguments forwarded to ``jit_fn.get_tir()``.
-
-    Returns
-    -------
-    str
-        Kernel body string with group-init, group barriers, and lowered
-        collectives.
-    """
-    if backend is None:
-        backend = SoftHierCollectiveBackend()
-
-    if cluster_ids is None and hw_binding is not None:
-        all_ids = set()
-        for ids in hw_binding.cluster_ids.values():
-            all_ids.update(ids)
-        cluster_ids = sorted(all_ids)
-
-    primfunc = jit_fn.get_tir(**tir_kwargs)
-    ctxt = _make_softhier_ctxt(network_name)
-    visitor = TilelangVisitor(
-        cluster_policy=cluster_policy,
-        num_clusters=num_clusters,
-        cluster_ids=cluster_ids,
-        group_registry=group_registry,
-        hw_binding=hw_binding,
-    )
-    tilebinding = visitor.visit_bindings(primfunc, ctxt)
-
-    # After visiting, use the registry that the visitor populated from the kernel
-    # spec (via T.cluster_group annotations).  When the caller passed group_registry=None,
-    # the visitor auto-creates a ClusterGroupRegistry; we pick it up here so that
-    # the passes below see the full group geometry without requiring a manual registry
-    # in driver code.
-    effective_registry = visitor.group_registry if group_registry is None else group_registry
-
-    # Replace default GlobalClusterBarrierPass with group-aware pass;
-    # keep SoftwarePipelinePass first to handle T.Pipelined(num_stages=N) loops.
-    # Pass group_registry so SoftwarePipelinePass can emit strided K-split loops
-    # for multi-cluster TP groups instead of running all K-blocks on every cluster.
-    from Deeploy.TileIR.Passes.SpatzVectorization import SpatzVectorizationPass
-    tilebinding.binding_passes = [SoftwarePipelinePass(group_registry=effective_registry), HoistAllocFreePass(), SpatzVectorizationPass(), GroupAwareBarrierPass()]
-    # Add collective lowering pass
-    tilebinding.add_binding_pass(
-        CollectiveLoweringPass(
-            registry=effective_registry,
-            hw_binding=hw_binding,
-            backend=backend,
-        ))
-    # Final cleanup: collapse runs of consecutive intra-cluster syncs.
-    tilebinding.add_binding_pass(DedupSyncPass())
-
-    ctxt, eb = tilebinding.codeTransform(ctxt)
-    return eb.generate(ctxt)
-```
-
-### Frontend
-
-> `TileIR/Frontend/TilelangVisitor.py`
-
-Visitor: Key entry function is `_visit_stmt`. Based on the type of TVM op, call corresponding `_visit_` function. Such function checks on arguments of TVM op, do initial checks, convert to annotations and call `_emit_binding` to emit one `TileBinding` with information collected.
-
-When adding a new op, here might need a new visitor function.
-
-> `ShardMetadata` now not used. Previously designed to record predefined parallelization strategies information
-
-### Midend
-
-> `TileIR/Passes`
-
-General philosophy:
-- Recognize pattern in current ordered list of `TileBinding` 
-- Replace it with desired new `TileBinding`s
-
-### Backend
-
-> `TileIR/Backend/Templates`
-
-Basically Mako templates as in Deeploy's design.
-
+For collective ops, also add a strategy in `Backend/CollectiveStrategies.py` implementing `matches()` and `emit()`.

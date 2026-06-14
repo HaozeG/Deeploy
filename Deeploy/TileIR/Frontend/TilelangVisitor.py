@@ -111,8 +111,6 @@ from Deeploy.TileIR.IR.CollectiveBinding import CollectiveBinding
 from Deeploy.TileIR.IR.CollectivePrimitives import (
     ClusterGroupRegistry,
     CollectiveOpSpec,
-    ShardMetadata,
-    TensorLayout,
     parse_cluster_group_spec,
 )
 from Deeploy.TileIR.IR.TileBinding import TileBinding
@@ -290,7 +288,7 @@ class _ExprStringifier:
         return f"tile_fp16_max({self.stringify(expr.a)}, {self.stringify(expr.b)})"
 
     def _str_Min(self, expr) -> str:
-        self._used_math.add("max")  # reuses tile_fp16_min which shares max style
+        self._used_math.add("min")
         return f"tile_fp16_min({self.stringify(expr.a)}, {self.stringify(expr.b)})"
 
     def _str_Cast(self, expr) -> str:
@@ -397,14 +395,10 @@ class TilelangVisitor:
         cluster_id : Optional[int]
                 Default cluster ID used as fallback when no explicit or inferred
                 cluster is available.
-        cluster_policy : str
-                Cluster assignment policy.
-                - ``"explicit_attr"``: only ``T.attr(..., "cluster_id", ...)`` plus
-                    fallback defaults.
-                - ``"block_idx"``: infer cluster from block indices (bx/by/bz) when
-                    available, then fallback defaults.
-                - ``"hybrid"``: explicit attr overrides block-index inference, then
-                    fallback defaults.
+        use_block_idx : bool
+                When True, infer cluster from block indices (bx/by/bz) when no
+                explicit ``T.attr(..., "cluster_id", ...)`` is present. Explicit
+                attrs always take precedence. Default False (explicit attrs only).
         num_clusters : Optional[int]
                 Number of clusters for modulo mapping from block id to cluster id.
                 If omitted, inferred block id is used directly.
@@ -413,7 +407,7 @@ class TilelangVisitor:
     def __init__(
         self,
         cluster_id: Optional[int] = None,
-        cluster_policy: str = "hybrid",
+        use_block_idx: bool = False,
         num_clusters: Optional[int] = None,
         cluster_ids: Optional[List[int]] = None,
         group_registry: Optional[ClusterGroupRegistry] = None,
@@ -424,7 +418,7 @@ class TilelangVisitor:
                 "TVM is required for TilelangVisitor."
             )
         self.cluster_id: Optional[int] = cluster_id
-        self.cluster_policy = cluster_policy
+        self.use_block_idx = use_block_idx
         self.group_registry: Optional[ClusterGroupRegistry] = group_registry
         self.hw_binding = hw_binding
 
@@ -437,12 +431,6 @@ class TilelangVisitor:
         else:
             self.cluster_ids = None
         self.num_clusters = len(self.cluster_ids) if self.cluster_ids else num_clusters
-
-        if self.cluster_policy not in ("explicit_attr", "block_idx", "hybrid"):
-            raise ValueError(
-                f"Unsupported cluster_policy='{self.cluster_policy}'. "
-                "Use one of: explicit_attr, block_idx, hybrid."
-            )
 
         # State accumulated during visit
         self._ctxt: Optional[NetworkContext] = None
@@ -540,9 +528,6 @@ class TilelangVisitor:
         self._block_axes = {}
         self._block_extents = {}
         self._current_group_id = None
-        # Buffer-name → TensorLayout, populated by "layout" AttrStmt
-        self._buffer_layouts: Dict[str, TensorLayout] = {}
-
         # 1. Extract cluster_id from function attrs if present
         self._primfunc_cluster_id = None
         if hasattr(primfunc, "attrs") and primfunc.attrs is not None:
@@ -570,7 +555,7 @@ class TilelangVisitor:
                 template=TileMathPreambleTemplate,
                 operator_representation={
                     "cluster_id": None,
-                    "shard_metadata": None,
+                    "shard_group_id": None,
                 },
                 op_name="tile_math_preamble",
             )
@@ -581,16 +566,16 @@ class TilelangVisitor:
     def _emit_binding(self, op_kind: str, template: NodeTemplate, rep: Dict, code_transformer: Optional[CodeTransformation] = None) -> None:
         """Record one TileBinding operation in visit order.
 
-        Automatically injects ``shard_metadata`` (from ``_current_group_id``)
+        Automatically injects ``shard_group_id`` (from ``_current_group_id``)
         into *rep* when it is not already present.  This ensures every binding
         emitted inside a ``T.attr("anno", "cluster_group", ...)`` block is
-        tagged with the correct group metadata, which ``CollectiveLoweringPass``
+        tagged with the correct group id, which ``CollectiveLoweringPass``
         uses to detect which groups need a ``GridSyncGroupInfo`` init prefix.
         """
         if self._bindings is None:
             raise RuntimeError("TileBinding pipeline is not initialized. Call visit_bindings() first.")
-        if "shard_metadata" not in rep:
-            rep["shard_metadata"] = self._make_shard_metadata()
+        if "shard_group_id" not in rep:
+            rep["shard_group_id"] = self._current_group_id
         self._bindings.add(TileBinding(op_kind=op_kind, template=template, operator_representation=rep, code_transformer=code_transformer))
 
     def _fallback_cluster(self):
@@ -600,11 +585,6 @@ class TilelangVisitor:
             return self.cluster_id, "constructor_default"
         return None, "none"
 
-    def _make_shard_metadata(self) -> Optional[ShardMetadata]:
-        """Return a ShardMetadata for the current group context, or None."""
-        if self._current_group_id is None:
-            return None
-        return ShardMetadata(group_id=self._current_group_id)
 
     def _has_multi_cluster_group(self) -> bool:
         """Return True if any registered group has > 1 cluster per instance (TP-style)."""
@@ -649,24 +629,20 @@ class TilelangVisitor:
         return block_id, block_id
 
     def _resolve_cluster(self, explicit_cluster_id):
-        inferred_cluster_id, block_id_expr = self._infer_cluster_from_block_idx()
         fallback_cluster_id, fallback_source = self._fallback_cluster()
 
-        if self.cluster_policy == "explicit_attr":
-            if explicit_cluster_id is not None:
-                return explicit_cluster_id, "explicit_attr", block_id_expr
-            return fallback_cluster_id, fallback_source, block_id_expr
+        # Explicit T.attr cluster_id always wins.
+        if explicit_cluster_id is not None:
+            _, block_id_expr = self._infer_cluster_from_block_idx()
+            return explicit_cluster_id, "explicit_attr", block_id_expr
 
-        if self.cluster_policy == "block_idx":
+        if self.use_block_idx:
+            inferred_cluster_id, block_id_expr = self._infer_cluster_from_block_idx()
             if inferred_cluster_id is not None:
                 return inferred_cluster_id, "block_idx", block_id_expr
             return fallback_cluster_id, fallback_source, block_id_expr
 
-        # hybrid
-        if explicit_cluster_id is not None:
-            return explicit_cluster_id, "explicit_attr", block_id_expr
-        if inferred_cluster_id is not None:
-            return inferred_cluster_id, "block_idx", block_id_expr
+        _, block_id_expr = self._infer_cluster_from_block_idx()
         return fallback_cluster_id, fallback_source, block_id_expr
 
     def _infer_memory_level_from_name(self, buf_name: str) -> str:
@@ -1105,25 +1081,8 @@ class TilelangVisitor:
         # Pre-scan body for a cluster_group annotation so allocs are tagged correctly
         # even though the AttrStmt is inside the body (not wrapping the Block itself).
         current_group_id = self._current_group_id or self._peek_cluster_group(stmt.body)
-        # Build a ShardMetadata for the alloc/free reps using the pre-scanned group_id
-        alloc_shard_meta = (
-            self._make_shard_metadata()
-            if self._current_group_id is not None
-            else (
-                ShardMetadata(
-                    group_id=current_group_id,
-                    # parallelism_strategy=(
-                    #     self.group_registry.get(current_group_id).strategy.value
-                    #     if (current_group_id is not None
-                    #         and self.group_registry is not None
-                    #         and self.group_registry.contains(current_group_id))
-                    #     else None
-                    # ),
-                )
-                if current_group_id is not None
-                else None
-            )
-        )
+        # Tag alloc/free reps with the enclosing cluster group id (plain string).
+        alloc_shard_meta = self._current_group_id if self._current_group_id is not None else current_group_id
 
         alloc_buffers = getattr(stmt, "alloc_buffers", [])
 
@@ -1237,7 +1196,7 @@ class TilelangVisitor:
                 "cluster_map":    op_metadata.get("cluster_map"),
                 "block_id_expr":  op_metadata.get("block_id_expr"),
                 "metadata":       op_metadata,
-                "shard_metadata": alloc_shard_meta,
+                "shard_group_id": alloc_shard_meta,
             }
             self._emit_binding("alloc", TileAllocTemplate, rep)
 
@@ -1256,7 +1215,7 @@ class TilelangVisitor:
                 "cluster_map":    op_metadata.get("cluster_map"),
                 "block_id_expr":  op_metadata.get("block_id_expr"),
                 "metadata":       op_metadata,
-                "shard_metadata": alloc_shard_meta,
+                "shard_group_id": alloc_shard_meta,
             }
             self._emit_binding("free", TileFreeTemplate, rep)
         # TODO: consider deallocating local buffers at the end of their block scope, align with cluster id
@@ -1273,7 +1232,7 @@ class TilelangVisitor:
         * ``node == "anno"`` and ``attr_key == "cluster_group"`` — sets the
           current group context (``_current_group_id``) and propagates it to
           the subtree; all operations emitted within this block are tagged with
-          the group's ``ShardMetadata``.
+          the group's ``shard_group_id``.
         * ``attr_key == "thread_extent"`` with ``blockIdx.*`` thread tag —
           emits a C for-loop and tracks block axes for cluster inference.
         * All other AttrStmt nodes (e.g. ``threadIdx.*``) — recurse into
@@ -1994,9 +1953,6 @@ class TilelangVisitor:
             dst_buffer=dst_buf,
             reduce_op=reduce_op,
         )
-        shard_meta = self._make_shard_metadata()
-        if shard_meta is None and group_id is not None:
-            shard_meta = ShardMetadata(group_id=group_id)
         rep = {
             "src_name":       src_buf,
             "dst_name":       dst_buf,
@@ -2004,7 +1960,7 @@ class TilelangVisitor:
             "group_id":       group_id,
             "nbytes":         nbytes,
             "cluster_id":     None,  # guard is inside template
-            "shard_metadata": shard_meta,
+            "shard_group_id": self._current_group_id or group_id,
         }
         self._emit_binding(
             "group_collective",
@@ -2037,8 +1993,7 @@ class TilelangVisitor:
 
         ``reduce_axis`` resolution order:
           1. explicit ``axis=`` string from the intrinsic (args[2]);
-          2. legacy ``TensorLayout.partial`` annotation on the buffer;
-          3. when the group is 2-D (one extent > 1), the single non-degenerate
+          2. when the group is 2-D (one extent > 1), the single non-degenerate
              axis name from ``ClusterGroup.axis_names``;
           4. ``None`` — full-group reduction.
         """
@@ -2063,22 +2018,9 @@ class TilelangVisitor:
         else:
             nbytes = 0
 
-        reduce_axis: Optional[str] = None
-        src_layout = None
+        reduce_axis: Optional[str] = axis_arg if axis_arg else None
 
-        # 1. Explicit axis kwarg on the intrinsic (new primary path).
-        if axis_arg:
-            reduce_axis = axis_arg
-
-        # 2. Legacy TensorLayout.partial annotation (kept for internal passes).
-        if reduce_axis is None:
-            layout = self._buffer_layouts.get(buf_name)
-            if layout is not None:
-                src_layout = layout
-                if layout.is_partial:
-                    reduce_axis = layout.reduce_axis()
-
-        # 3. Infer from 2-D group shape: if exactly one group extent > 1, use
+        # Infer from 2-D group shape: if exactly one group extent > 1, use
         # its axis_name.  This covers `T.cluster_group(x=N, y=1)` (axis = x_name)
         # and `T.cluster_group(x=1, y=N)` (axis = y_name).
         if reduce_axis is None and self.group_registry is not None and \
@@ -2110,15 +2052,8 @@ class TilelangVisitor:
             dst_buffer=buf_name,
             reduce_op=reduce_op,
             reduce_axis=reduce_axis,
-            src_layout=src_layout,
             global_barrier_before=global_barrier_before,
         )
-        shard_meta = self._make_shard_metadata()
-        # Fall back to the resolved group_id when _current_group_id was None
-        # (happens when the allreduce arg carries an explicit group name but the
-        # TIR places the Evaluate node outside the cluster_group AttrStmt body).
-        if shard_meta is None and group_id is not None:
-            shard_meta = ShardMetadata(group_id=group_id)
         rep = {
             "src_name":       buf_name,
             "dst_name":       buf_name,
@@ -2126,7 +2061,7 @@ class TilelangVisitor:
             "group_id":       group_id,
             "nbytes":         nbytes,
             "cluster_id":     None,
-            "shard_metadata": shard_meta,
+            "shard_group_id": self._current_group_id or group_id,
         }
         self._emit_binding(
             "group_collective",
@@ -2211,9 +2146,6 @@ class TilelangVisitor:
             from_coord=int_param if op == "bcast_axis" else 0,
             from_coord_expr=from_coord_expr if op == "bcast_axis" else None,
         )
-        shard_meta = self._make_shard_metadata()
-        if shard_meta is None and group_id is not None:
-            shard_meta = ShardMetadata(group_id=group_id)
         rep = {
             "src_name":       buf_name,
             "dst_name":       buf_name,
@@ -2221,7 +2153,7 @@ class TilelangVisitor:
             "group_id":       group_id,
             "nbytes":         nbytes,
             "cluster_id":     None,
-            "shard_metadata": shard_meta,
+            "shard_group_id": self._current_group_id or group_id,
         }
         self._emit_binding(
             "group_collective",
@@ -2348,7 +2280,6 @@ class TilelangVisitor:
         nbytes = int(args[2]) if len(args) > 2 and hasattr(args[2], "__int__") else 0
 
         group_id = self._current_group_id
-        shard_meta = self._make_shard_metadata()
         resolved_cluster_id, op_metadata = self._op_metadata(cluster_id)
 
         rep = {
@@ -2359,7 +2290,7 @@ class TilelangVisitor:
             "group_id":         group_id,
             "cluster_id":       resolved_cluster_id,
             "metadata":         op_metadata,
-            "shard_metadata":   shard_meta,
+            "shard_group_id":   group_id,
         }
         self._emit_binding("alloc_reducer", TileAllocReducerTemplate, rep)
 
@@ -2449,9 +2380,6 @@ class TilelangVisitor:
         tvm_buf = self._local_bufs.get(buf_name) or self._global_bufs.get(buf_name)
         nbytes = _prod(tvm_buf.shape) * _dtype_bytes(str(tvm_buf.dtype)) if tvm_buf is not None else 0
 
-        shard_meta = self._make_shard_metadata()
-        if shard_meta is None and group_id:
-            shard_meta = ShardMetadata(group_id=group_id)
         rep = {
             "src_name":       buf_name,
             "dst_name":       buf_name,
@@ -2459,7 +2387,7 @@ class TilelangVisitor:
             "group_id":       group_id,
             "nbytes":         nbytes,
             "cluster_id":     None,
-            "shard_metadata": shard_meta,
+            "shard_group_id": self._current_group_id or group_id,
         }
         self._emit_binding(
             "group_collective",
@@ -2538,9 +2466,6 @@ class TilelangVisitor:
         tvm_buf = self._local_bufs.get(buf_name) or self._global_bufs.get(buf_name)
         nbytes = _prod(tvm_buf.shape) * _dtype_bytes(str(tvm_buf.dtype)) if tvm_buf is not None else 0
 
-        shard_meta = self._make_shard_metadata()
-        if shard_meta is None and group_id:
-            shard_meta = ShardMetadata(group_id=group_id)
         rep = {
             "src_name":       buf_name,
             "dst_name":       buf_name,
@@ -2548,7 +2473,7 @@ class TilelangVisitor:
             "group_id":       group_id,
             "nbytes":         nbytes,
             "cluster_id":     None,
-            "shard_metadata": shard_meta,
+            "shard_group_id": self._current_group_id or group_id,
         }
         self._emit_binding(
             "group_collective",

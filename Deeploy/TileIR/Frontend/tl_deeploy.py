@@ -275,17 +275,6 @@ def sync_grid() -> "tir.PrimExpr":
     )
 
 
-def thread_return() -> "tir.PrimExpr":
-    """Early return from the current cluster's kernel block.
-
-    Emits ``return;`` inside the cluster guard, allowing a cluster to exit
-    the kernel early (e.g. when its work partition is empty).
-    """
-    return tir.call_intrin(
-        "handle",
-        tir.op.Op.get("tl.deeploy.thread_return"),
-    )
-
 
 def device_assert(condition: Union[bool, "tir.PrimExpr"], message: str = "") -> "tir.PrimExpr":
     """Runtime assertion that prints *message* and aborts on failure.

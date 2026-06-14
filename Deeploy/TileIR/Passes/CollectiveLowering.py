@@ -163,10 +163,9 @@ class CollectiveLoweringPass(TileBindingPass):
                             hb.operator_representation["nbytes"] = nbytes
                     transformed.append(hb)
 
-            elif binding.op_kind == "alloc" and self._group_id_of(binding) is not None:
+            elif binding.op_kind == "alloc" and (gid := self._group_id_of(binding)) is not None:
                 # Tag group-member allocs for guard generation
                 binding.operator_representation["cluster_guard_type"] = "group_membership"
-                gid = self._group_id_of(binding)
                 cluster_ids = self.registry.clusters_for(gid)
                 binding.operator_representation["group_cluster_ids"] = cluster_ids
                 transformed.append(binding)
@@ -178,10 +177,5 @@ class CollectiveLoweringPass(TileBindingPass):
 
     @staticmethod
     def _group_id_of(binding: TileBinding) -> Optional[str]:
-        """Return the group_id from a binding's shard_metadata, or None."""
-        shard_meta = binding.operator_representation.get("shard_metadata", None)
-        if shard_meta is None:
-            return None
-        if hasattr(shard_meta, "group_id"):
-            return shard_meta.group_id
-        return None
+        """Return the shard_group_id from a binding's operator_representation, or None."""
+        return binding.operator_representation.get("shard_group_id")

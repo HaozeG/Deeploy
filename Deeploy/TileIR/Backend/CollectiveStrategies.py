@@ -180,11 +180,76 @@ def _collective_op_kind(reduce_op: str) -> str:
     return mapping[reduce_op]
 
 
+def _emit_reduce_broadcast_bindings(
+    gid: str,
+    src_buffer: str,
+    dst_buffer: str,
+    root_cluster_id: int,
+    op_kind: str,
+    row_mask: str,
+    col_mask: str,
+    edge_flag: str,
+    global_barrier: bool,
+    nbytes_placeholder: str,
+    reduce_op_name: str,
+    bcast_op_name: str,
+) -> List["TileBinding"]:
+    """Build the standard reduce + broadcast TileBinding pair."""
+    from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
+        TileCollectiveBroadcastTemplate,
+        TileCollectiveReduceTemplate,
+    )
+    from Deeploy.TileIR.IR.TileBinding import TileBinding
+
+    reduce_rep = {
+        "src_name":           src_buffer,
+        "dst_name":           dst_buffer,
+        "root_cluster_id":    root_cluster_id,
+        "group_id":           gid,
+        "collective_op_kind": op_kind,
+        "row_mask":           row_mask,
+        "col_mask":           col_mask,
+        "edge_flag":          edge_flag,
+        "global_barrier":     global_barrier,
+        "nbytes":             nbytes_placeholder,
+        "cluster_id":         None,
+        "shard_group_id":     None,
+    }
+    bcast_rep = {
+        "src_name":        dst_buffer,
+        "dst_name":        dst_buffer,
+        "root_cluster_id": root_cluster_id,
+        "group_id":        gid,
+        "row_mask":        row_mask,
+        "col_mask":        col_mask,
+        "edge_flag":       edge_flag,
+        "global_barrier":  global_barrier,
+        "nbytes":          nbytes_placeholder,
+        "cluster_id":      None,
+        "shard_group_id":  None,
+    }
+    return [
+        TileBinding(
+            op_kind="group_collective",
+            template=TileCollectiveReduceTemplate,
+            operator_representation=reduce_rep,
+            op_name=reduce_op_name,
+        ),
+        TileBinding(
+            op_kind="group_collective",
+            template=TileCollectiveBroadcastTemplate,
+            operator_representation=bcast_rep,
+            op_name=bcast_op_name,
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Strategy 1: AxisReduceBroadcast
-#   Fires when: op == "allreduce" AND (reduce_axis is set OR src_layout.partial)
-#   Pattern: single axis-scoped reduce + broadcast using edge-cluster gating
-#   and runtime wakeup_*_mask.  This is the SUMMA/FlatAttention pattern.
+#   Fires when: op == "allreduce" AND spec.reduce_axis is set
+#   Pattern: axis-scoped reduce + broadcast via edge-cluster gating
+#   and runtime wakeup_*_mask.  SUMMA/FlatAttention pattern.
+#   split-K cross-instance path: global_barrier_before=True → inverted masks.
 # ---------------------------------------------------------------------------
 
 class AxisReduceBroadcast(CollectiveStrategy):
@@ -192,7 +257,7 @@ class AxisReduceBroadcast(CollectiveStrategy):
 
     Matches when:
       - op == "allreduce", AND
-      - reduce_axis is set OR src_layout.partial is set
+      - reduce_axis is set
 
     Emits:
       1. TileCollectiveReduceTemplate with runtime wakeup_row/col_mask
@@ -200,87 +265,30 @@ class AxisReduceBroadcast(CollectiveStrategy):
     """
 
     def matches(self, spec, group, topology):
-        if spec.op != "allreduce":
-            return False
-        if spec.reduce_axis is not None:
-            return True
-        if spec.src_layout is not None and spec.src_layout.is_partial:
-            return True
-        return False
+        return spec.op == "allreduce" and spec.reduce_axis is not None
 
     def emit(self, spec, binding, registry) -> List["TileBinding"]:
-        from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
-            TileCollectiveBroadcastTemplate,
-            TileCollectiveReduceTemplate,
-        )
-        from Deeploy.TileIR.IR.TileBinding import TileBinding
-
         group = registry.get(spec.group_id)
         gid = spec.group_id
-        root_cluster_id = binding.root_cluster_for(gid, registry)
-
-        # Determine reduce axis
-        reduce_axis = spec.reduce_axis
-        if reduce_axis is None and spec.src_layout is not None:
-            reduce_axis = spec.src_layout.reduce_axis()
-
-        row_mask, col_mask, edge_flag = _row_col_masks(gid, reduce_axis, group)
-        op_kind = _collective_op_kind(spec.reduce_op)
-        nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
-
-        # Split-K cross-instance reduction: use inverted masks so the DMA reduction
-        # tree spans corresponding ranks across all group instances, and use a global
-        # barrier (flex_global_barrier_xy) instead of the per-group barrier.
-        # Matches SummaGEMM.h:396-397,480-481 (~wakeup_row_mask / ~wakeup_col_mask).
         global_barrier = spec.global_barrier_before
         if global_barrier:
-            row_mask = f"(~group_info_{gid}.wakeup_row_mask)"
-            col_mask = f"(~group_info_{gid}.wakeup_col_mask)"
-            # All clusters in every instance participate; edge_flag = rowwise (same formula)
-            edge_flag = f"cluster_for_rowwise_{gid}"
-
-        reduce_rep = {
-            "src_name":           spec.src_buffer,
-            "dst_name":           spec.src_buffer,  # in-place
-            "root_cluster_id":    root_cluster_id,
-            "group_id":           gid,
-            "collective_op_kind": op_kind,
-            "row_mask":           row_mask,
-            "col_mask":           col_mask,
-            "edge_flag":          edge_flag,
-            "global_barrier":     global_barrier,
-            "nbytes":             nbytes_placeholder,
-            "cluster_id":         None,
-            "shard_metadata":     None,
-        }
-        bcast_rep = {
-            "src_name":        spec.src_buffer,
-            "dst_name":        spec.src_buffer,
-            "root_cluster_id": root_cluster_id,
-            "group_id":        gid,
-            "row_mask":        row_mask,
-            "col_mask":        col_mask,
-            "edge_flag":       edge_flag,
-            "global_barrier":  global_barrier,
-            "nbytes":          nbytes_placeholder,
-            "cluster_id":      None,
-            "shard_metadata":  None,
-        }
-
-        return [
-            TileBinding(
-                op_kind="group_collective",
-                template=TileCollectiveReduceTemplate,
-                operator_representation=reduce_rep,
-                op_name=f"tile_collective_reduce_{gid}",
-            ),
-            TileBinding(
-                op_kind="group_collective",
-                template=TileCollectiveBroadcastTemplate,
-                operator_representation=bcast_rep,
-                op_name=f"tile_collective_broadcast_{gid}",
-            ),
-        ]
+            row_mask, col_mask, edge_flag = _inter_group_masks(gid, spec.reduce_axis, group)
+        else:
+            row_mask, col_mask, edge_flag = _row_col_masks(gid, spec.reduce_axis, group)
+        return _emit_reduce_broadcast_bindings(
+            gid=gid,
+            src_buffer=spec.src_buffer,
+            dst_buffer=spec.src_buffer,
+            root_cluster_id=binding.root_cluster_for(gid, registry),
+            op_kind=_collective_op_kind(spec.reduce_op),
+            row_mask=row_mask,
+            col_mask=col_mask,
+            edge_flag=edge_flag,
+            global_barrier=global_barrier,
+            nbytes_placeholder=f"sizeof_buffer_{spec.src_buffer}",
+            reduce_op_name=f"tile_collective_reduce_{gid}",
+            bcast_op_name=f"tile_collective_broadcast_{gid}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +326,7 @@ class AxisBroadcast(CollectiveStrategy):
             "edge_flag":       edge_flag,
             "nbytes":          nbytes_placeholder,
             "cluster_id":      None,
-            "shard_metadata":  None,
+            "shard_group_id":  None,
         }
 
         return [
@@ -348,60 +356,23 @@ class FullGroupReduceBroadcast(CollectiveStrategy):
         return spec.op == "allreduce"
 
     def emit(self, spec, binding, registry) -> List["TileBinding"]:
-        from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
-            TileCollectiveBroadcastTemplate,
-            TileCollectiveReduceTemplate,
-        )
-        from Deeploy.TileIR.IR.TileBinding import TileBinding
-
         group = registry.get(spec.group_id)
         gid = spec.group_id
-        root_cluster_id = binding.root_cluster_for(gid, registry)
-        # Use row-wise pattern as default for full-group
         row_mask, col_mask, edge_flag = _row_col_masks(gid, None, group)
-        op_kind = _collective_op_kind(spec.reduce_op)
-        nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
-
-        reduce_rep = {
-            "src_name":           spec.src_buffer,
-            "dst_name":           spec.src_buffer,
-            "root_cluster_id":    root_cluster_id,
-            "group_id":           gid,
-            "collective_op_kind": op_kind,
-            "row_mask":           row_mask,
-            "col_mask":           col_mask,
-            "edge_flag":          edge_flag,
-            "nbytes":             nbytes_placeholder,
-            "cluster_id":         None,
-            "shard_metadata":     None,
-        }
-        bcast_rep = {
-            "src_name":        spec.src_buffer,
-            "dst_name":        spec.src_buffer,
-            "root_cluster_id": root_cluster_id,
-            "group_id":        gid,
-            "row_mask":        row_mask,
-            "col_mask":        col_mask,
-            "edge_flag":       edge_flag,
-            "nbytes":          nbytes_placeholder,
-            "cluster_id":      None,
-            "shard_metadata":  None,
-        }
-
-        return [
-            TileBinding(
-                op_kind="group_collective",
-                template=TileCollectiveReduceTemplate,
-                operator_representation=reduce_rep,
-                op_name=f"tile_collective_reduce_{gid}",
-            ),
-            TileBinding(
-                op_kind="group_collective",
-                template=TileCollectiveBroadcastTemplate,
-                operator_representation=bcast_rep,
-                op_name=f"tile_collective_broadcast_{gid}",
-            ),
-        ]
+        return _emit_reduce_broadcast_bindings(
+            gid=gid,
+            src_buffer=spec.src_buffer,
+            dst_buffer=spec.src_buffer,
+            root_cluster_id=binding.root_cluster_for(gid, registry),
+            op_kind=_collective_op_kind(spec.reduce_op),
+            row_mask=row_mask,
+            col_mask=col_mask,
+            edge_flag=edge_flag,
+            global_barrier=False,
+            nbytes_placeholder=f"sizeof_buffer_{spec.src_buffer}",
+            reduce_op_name=f"tile_collective_reduce_{gid}",
+            bcast_op_name=f"tile_collective_broadcast_{gid}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +407,7 @@ class ScatterStrategy(CollectiveStrategy):
             "num_members":     num_members,
             "chunk_nbytes":    f"(({nbytes_placeholder}) / {num_members})",
             "cluster_id":      None,
-            "shard_metadata":  None,
+            "shard_group_id":  None,
         }
 
         return [
@@ -481,7 +452,7 @@ class GatherStrategy(CollectiveStrategy):
             "num_members":     num_members,
             "chunk_nbytes":    f"(({nbytes_placeholder}) / {num_members})",
             "cluster_id":      None,
-            "shard_metadata":  None,
+            "shard_group_id":  None,
         }
 
         return [
@@ -543,7 +514,7 @@ class GroupShift(CollectiveStrategy):
             "shift_fn":       shift_fn,
             "nbytes":         nbytes_placeholder,
             "cluster_id":     None,
-            "shard_metadata": None,
+            "shard_group_id": None,
         }
         return [
             TileBinding(
@@ -603,7 +574,7 @@ class GroupBcastAxis(CollectiveStrategy):
             "edge_flag":      edge_flag,
             "nbytes":         nbytes_placeholder,
             "cluster_id":     None,
-            "shard_metadata": None,
+            "shard_group_id": None,
         }
         return [
             TileBinding(
@@ -636,17 +607,7 @@ class DpReduceStrategy(CollectiveStrategy):
         return spec.op == "dp_reduce"
 
     def emit(self, spec, binding, registry) -> List["TileBinding"]:
-        from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import (
-            TileCollectiveBroadcastTemplate,
-            TileCollectiveReduceTemplate,
-        )
-        from Deeploy.TileIR.IR.TileBinding import TileBinding
-
         gid = spec.group_id
-        root_cluster_id = binding.root_cluster_for(gid, registry)
-        op_kind = _collective_op_kind(spec.reduce_op)
-        nbytes_placeholder = f"sizeof_buffer_{spec.src_buffer}"
-
         group = registry.get(gid)
         if spec.level == "inter_group":
             row_mask, col_mask, edge_flag = _inter_group_masks(gid, spec.axis, group)
@@ -654,49 +615,20 @@ class DpReduceStrategy(CollectiveStrategy):
         else:
             row_mask, col_mask, edge_flag = _row_col_masks(gid, spec.axis, group)
             global_barrier = False
-
-        reduce_rep = {
-            "src_name":           spec.src_buffer,
-            "dst_name":           spec.src_buffer,
-            "root_cluster_id":    root_cluster_id,
-            "group_id":           gid,
-            "collective_op_kind": op_kind,
-            "row_mask":           row_mask,
-            "col_mask":           col_mask,
-            "edge_flag":          edge_flag,
-            "global_barrier":     global_barrier,
-            "nbytes":             nbytes_placeholder,
-            "cluster_id":         None,
-            "shard_metadata":     None,
-        }
-        bcast_rep = {
-            "src_name":        spec.src_buffer,
-            "dst_name":        spec.src_buffer,
-            "root_cluster_id": root_cluster_id,
-            "group_id":        gid,
-            "row_mask":        row_mask,
-            "col_mask":        col_mask,
-            "edge_flag":       edge_flag,
-            "global_barrier":  global_barrier,
-            "nbytes":          nbytes_placeholder,
-            "cluster_id":      None,
-            "shard_metadata":  None,
-        }
-
-        return [
-            TileBinding(
-                op_kind="group_collective",
-                template=TileCollectiveReduceTemplate,
-                operator_representation=reduce_rep,
-                op_name=f"tile_dp_reduce_{gid}",
-            ),
-            TileBinding(
-                op_kind="group_collective",
-                template=TileCollectiveBroadcastTemplate,
-                operator_representation=bcast_rep,
-                op_name=f"tile_dp_reduce_bcast_{gid}",
-            ),
-        ]
+        return _emit_reduce_broadcast_bindings(
+            gid=gid,
+            src_buffer=spec.src_buffer,
+            dst_buffer=spec.src_buffer,
+            root_cluster_id=binding.root_cluster_for(gid, registry),
+            op_kind=_collective_op_kind(spec.reduce_op),
+            row_mask=row_mask,
+            col_mask=col_mask,
+            edge_flag=edge_flag,
+            global_barrier=global_barrier,
+            nbytes_placeholder=f"sizeof_buffer_{spec.src_buffer}",
+            reduce_op_name=f"tile_dp_reduce_{gid}",
+            bcast_op_name=f"tile_dp_reduce_bcast_{gid}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +675,7 @@ class DpBroadcastStrategy(CollectiveStrategy):
                 "edge_flag":       edge_flag,
                 "nbytes":          nbytes_placeholder,
                 "cluster_id":      None,
-                "shard_metadata":  None,
+                "shard_group_id":  None,
             }
             return [
                 TileBinding(
@@ -779,7 +711,7 @@ class DpBroadcastStrategy(CollectiveStrategy):
             "edge_flag":  edge_flag,
             "nbytes":     nbytes_placeholder,
             "cluster_id": None,
-            "shard_metadata": None,
+            "shard_group_id": None,
         }
         return [
             TileBinding(

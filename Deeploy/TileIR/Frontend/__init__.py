@@ -12,7 +12,6 @@ from Deeploy.TileIR.IR import (
     CollectiveBinding,
     CollectiveOpSpec,
     HardwareBinding,
-    ShardMetadata,
     SoftHierCollectiveBackend,
 )
 from Deeploy.TileIR.Passes import (
@@ -30,6 +29,5 @@ __all__ = [
     "CollectiveLoweringPass",
     "GroupAwareBarrierPass",
     "HardwareBinding",
-    "ShardMetadata",
     "SoftHierCollectiveBackend",
 ]

@@ -2,11 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for P0/P1 TileIR extensions: math builtins, sync_grid, thread_return,
-device_assert, intra-cluster reduce, and WorkPartitioningPass.
+"""Tests for P0/P1 TileIR extensions: math builtins, sync_grid, device_assert,
+and intra-cluster reduce.
 
-Control-flow / runtime intrinsics (sync_grid, thread_return, device_assert,
-assume) use the ``D.*`` namespace (``tl_deeploy``), following the same pattern
+Control-flow / runtime intrinsics (sync_grid, device_assert, assume) use the
+``D.*`` namespace (``tl_deeploy``), following the same pattern
 as ``D.reduce`` / ``D.broadcast``, to avoid conflicting with TileLang's native
 TIR lowering.
 
@@ -295,46 +295,7 @@ class TestSyncGrid:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: D.thread_return — early exit (P1)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.deeploy_internal
-@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="tilelang not installed")
-class TestThreadReturn:
-
-    @staticmethod
-    def _build_early_exit_kernel(N: int = 64):
-        import tilelang
-        import tilelang.language as T
-        from Deeploy.TileIR.Frontend import tl_deeploy as D
-
-        @tilelang.jit
-        def early_exit(X, N_: int):
-            dtype = T.float16
-            X: T.Tensor((N_,), dtype)
-            Y = T.empty((N_,), dtype)
-
-            with T.Kernel(1, threads=1) as (bx,):
-                loc = T.alloc_fragment((N_,), dtype)
-                T.copy(X[0:N_], loc)
-                for i in T.Parallel(N_):
-                    if loc[i] == T.float16(0.0):
-                        D.thread_return()
-                    loc[i] = T.sigmoid(loc[i])
-                T.copy(loc, Y[0:N_])
-            return Y
-
-        return early_exit
-
-    def test_thread_return_emits_return(self):
-        fn = self._build_early_exit_kernel(N=64)
-        X_in = np.zeros((64,), dtype=np.float16)
-        code = _compile_and_get_code(fn, X_in, N_=64)
-        _assert_code_contains(code, "return;", "early return statement")
-
-
-# ---------------------------------------------------------------------------
-# Test 4: D.device_assert / D.assume — runtime checks (P1)
+# Test 3: D.device_assert / D.assume — runtime checks (P1)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.deeploy_internal
@@ -402,51 +363,7 @@ class TestDeviceAssert:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: WorkPartitioningPass — unit tests (P1)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.deeploy_internal
-class TestWorkPartitioningPass:
-
-    def test_pass_prepends_preamble(self):
-        from Deeploy.TileIR.IR.TileBinding import TileBinding
-        from Deeploy.TileIR.Passes.WorkPartitioning import WorkPartitioningPass
-
-        existing = [
-            TileBinding(
-                op_kind="comment",
-                template=None,
-                operator_representation={},
-                op_name="test_binding",
-            )
-        ]
-        wpp = WorkPartitioningPass(num_elements="M")
-        result = wpp.apply(existing)
-
-        assert len(result) == 2
-        assert result[0].op_kind == "block_preamble"
-        assert result[1] is existing[0]
-
-    def test_pass_custom_num_clusters(self):
-        from Deeploy.TileIR.Passes.WorkPartitioning import WorkPartitioningPass
-
-        wpp = WorkPartitioningPass(num_elements="num_tokens", num_clusters="8")
-        result = wpp.apply([])
-        rep = result[0].operator_representation
-        assert rep["num_elements"] == "num_tokens"
-        assert rep["num_clusters"] == "8"
-
-    def test_pass_default_num_clusters(self):
-        from Deeploy.TileIR.Passes.WorkPartitioning import WorkPartitioningPass
-
-        wpp = WorkPartitioningPass(num_elements="N")
-        result = wpp.apply([])
-        rep = result[0].operator_representation
-        assert "ARCH_NUM_CLUSTER_X" in rep["num_clusters"]
-
-
-# ---------------------------------------------------------------------------
-# Test 6: GroupShift — compile-only validation (P1)
+# Test 4: GroupShift — compile-only validation (P1)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.tilelang

@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from Deeploy.DeeployTypes import NodeTemplate
 from Deeploy.TileIR.Backend.Templates.SoftHierCollectiveTemplates import TileGroupBarrierTemplate
-from Deeploy.TileIR.Backend.Templates.SoftHierTileTemplates import TileSyncTemplate
 from Deeploy.TileIR.IR.CollectiveBinding import CollectiveBinding
 from Deeploy.TileIR.IR.TileBinding import TileBinding, TileOpKind
 from Deeploy.TileIR.Passes.Base import (
     _INTRA_CLUSTER_SYNC_TEMPLATE,
+    _is_intra_cluster_sync,
     TileBindingPass,
 )
 
@@ -236,7 +236,7 @@ class SoftwarePipelinePass(TileBindingPass):
 
         Detection strategy (most to least specific):
 
-        1. Scan *inner_bindings* for a ``shard_metadata.group_id`` that maps to
+        1. Scan *inner_bindings* for a ``shard_group_id`` that maps to
            a group with ``group_x > 1`` in the registry.  This path fires when
            the cluster_group AttrStmt wraps the For loop body.
 
@@ -244,7 +244,7 @@ class SoftwarePipelinePass(TileBindingPass):
            ``group_x > 1`` AND a collective op in *collective_group_ids*.  This is
            needed because TileLang's lowering only attaches the cluster_group
            AttrStmt to the ``T.allreduce`` call, not to the surrounding For loop,
-           so inner bindings carry ``shard_metadata=None``.
+           so inner bindings carry ``shard_group_id=None``.
            Restricting to *collective_group_ids* prevents DP groups (group_x > 1
            but no collectives) from incorrectly triggering K-split.
 
@@ -255,17 +255,15 @@ class SoftwarePipelinePass(TileBindingPass):
             return None, 1
         _allreduce_groups = collective_group_ids or set()
 
-        # Strategy 1: shard_metadata on inner bindings (most specific).
+        # Strategy 1: shard_group_id on inner bindings (most specific).
         for b in inner_bindings:
-            sm = b.operator_representation.get("shard_metadata")
-            if sm is None or not hasattr(sm, "group_id") or not sm.group_id:
-                continue
-            if sm.group_id not in _allreduce_groups:
+            gid = b.operator_representation.get("shard_group_id")
+            if not gid or gid not in _allreduce_groups:
                 continue
             try:
-                group = self.group_registry.get(sm.group_id)
+                group = self.group_registry.get(gid)
                 if group.group_x > 1 and int(group.group_y) == 1:
-                    return sm.group_id, int(group.group_x)
+                    return gid, int(group.group_x)
             except (KeyError, AttributeError):
                 pass
         # Strategy 2: registry fallback — groups with allreduce AND group_x > 1.
@@ -610,10 +608,9 @@ class SoftwarePipelinePass(TileBindingPass):
         # For COMM pipelines the loop-top group-barrier + sync provides
         # inter-iteration synchronization; for non-COMM pipelines the
         # trailing sync emitted below serves the same purpose.
-        _intra_sync_templates = {_INTRA_CLUSTER_SYNC_TEMPLATE, TileSyncTemplate}
         while len(result) > _compute_start:
             _last = result[-1]
-            if _last.op_kind == "sync" and _last.template in _intra_sync_templates:
+            if _is_intra_cluster_sync(_last):
                 result.pop()
             else:
                 break
